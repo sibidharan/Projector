@@ -11,10 +11,9 @@
 //  1. Create an Aggregate Device combining mic (input) + HDMI (output)
 //     with drift compensation enabled for clock synchronization.
 //  2. Set the smallest possible I/O buffer size on both devices.
-//  3. HAL AudioUnit uses kAudioUnitProperty_MakeConnection to wire
-//     bus 1 (mic) directly to bus 0 (HDMI) inside CoreAudio's render
-//     graph — zero CPU per audio buffer. Falls back to render callback
-//     if direct connection is not supported.
+//  3. HAL AudioUnit with a lightweight render callback that pulls mic data
+//     from bus 1 and passes it through to bus 0 (HDMI). Zero processing —
+//     just a direct passthrough for minimum latency.
 //  4. Level metering is throttled to every 32nd callback (~6/sec at 256 samples)
 //     and quantized to 8 visual steps — only triggers SwiftUI redraw when the
 //     visible bar count actually changes. Uses coalesced DispatchQueue instead
@@ -253,43 +252,24 @@ final class AudioManager: ObservableObject {
                                       &processingFormat, asbdSize)
         print("[Audio] Set bus 0 input format (\(processingChannels)ch): status=\(status)")
 
-        // Try direct bus connection first (zero CPU overhead).
-        // kAudioUnitProperty_MakeConnection wires bus 1 output (mic data)
-        // directly to bus 0 input (HDMI output) inside CoreAudio's render
-        // graph — no callback, no CPU per buffer.
-        var connection = AudioUnitConnection(
-            sourceAudioUnit: unit,
-            sourceOutputNumber: 1,
-            destInputNumber: 0
+        // Render callback — pulls mic data from bus 1 and passes it to bus 0.
+        // This is a lightweight passthrough with throttled level metering.
+        // The callback itself does zero audio processing — just AudioUnitRender
+        // from bus 1 into the output buffer.
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        var callbackStruct = AURenderCallbackStruct(
+            inputProc: audioPassthroughCallback,
+            inputProcRefCon: selfPtr
         )
-        let connStatus = AudioUnitSetProperty(
-            unit,
-            kAudioUnitProperty_MakeConnection,
-            kAudioUnitScope_Input, 0,
-            &connection,
-            UInt32(MemoryLayout<AudioUnitConnection>.size)
-        )
-
-        if connStatus == noErr {
-            print("[Audio] Direct bus connection established (zero-CPU passthrough)")
-        } else {
-            // Fall back to render callback if direct connection not supported
-            print("[Audio] Direct connection failed (\(connStatus)), using render callback")
-            let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-            var callbackStruct = AURenderCallbackStruct(
-                inputProc: audioPassthroughCallback,
-                inputProcRefCon: selfPtr
-            )
-            status = AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback,
-                                          kAudioUnitScope_Input, 0,
-                                          &callbackStruct,
-                                          UInt32(MemoryLayout<AURenderCallbackStruct>.size))
-            guard status == noErr else {
-                routingError = "Cannot set render callback: \(status)"
-                AudioComponentInstanceDispose(unit)
-                destroyAggregateDevice()
-                return
-            }
+        status = AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback,
+                                      kAudioUnitScope_Input, 0,
+                                      &callbackStruct,
+                                      UInt32(MemoryLayout<AURenderCallbackStruct>.size))
+        guard status == noErr else {
+            routingError = "Cannot set render callback: \(status)"
+            AudioComponentInstanceDispose(unit)
+            destroyAggregateDevice()
+            return
         }
 
         // Initialize and start
