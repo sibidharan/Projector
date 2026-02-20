@@ -24,27 +24,15 @@ struct MenuBarView: View {
 
             Divider()
 
-            // Controls
-            VStack(spacing: 10) {
-                cameraSection
-                cameraModeSection
-                displaySection
-                displayModeSection
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-
-            Divider()
-
-            // Audio
-            audioSection
+            // INPUT section
+            inputSection
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
 
             Divider()
 
-            // Rendering
-            renderingSection
+            // OUTPUT section
+            outputSection
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
 
@@ -61,9 +49,20 @@ struct MenuBarView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
         }
-        .frame(width: 320)
+        .frame(width: 340)
         .onAppear {
             cameraManager.startSession()
+            audioManager.updateCameraAudioDevice(for: cameraManager.selectedCamera)
+            // Enable level metering only while the popover is visible
+            audioManager._meterEnabled = true
+        }
+        .onDisappear {
+            // Disable metering when popover closes — saves CPU on audio thread
+            audioManager._meterEnabled = false
+            audioManager.inputLevel = 0
+        }
+        .onChange(of: cameraManager.selectedCamera) { _, newCamera in
+            audioManager.updateCameraAudioDevice(for: newCamera)
         }
     }
 
@@ -72,7 +71,7 @@ struct MenuBarView: View {
     private var previewSection: some View {
         VStack(spacing: 8) {
             CameraPreviewView(captureSession: cameraManager.captureSession)
-                .frame(height: 174)
+                .frame(height: 180)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
@@ -126,9 +125,9 @@ struct MenuBarView: View {
                 Text("\u{2022}")
                     .foregroundStyle(.tertiary)
                 HStack(spacing: 3) {
-                    Image(systemName: "mic.fill")
+                    Image(systemName: audioManager.isCameraAudioSelected ? "video.fill" : "mic.fill")
                         .font(.system(size: 8))
-                    levelIndicator
+                    AudioLevelIndicator(audioManager: audioManager)
                 }
                 .foregroundStyle(.green)
             }
@@ -139,164 +138,203 @@ struct MenuBarView: View {
         .foregroundStyle(.secondary)
     }
 
-    private var levelIndicator: some View {
-        AudioLevelIndicator(audioManager: audioManager)
-    }
+    // MARK: - INPUT Section
 
-    // MARK: - Camera Selection
+    private var inputSection: some View {
+        VStack(spacing: 0) {
+            // Section header
+            sectionHeader("INPUT", icon: "arrow.down.circle.fill", color: .blue)
+                .padding(.bottom, 10)
 
-    private var cameraSection: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "camera.fill")
-                .frame(width: 16)
-                .foregroundStyle(.secondary)
-            Picker("Camera", selection: $cameraManager.selectedCamera) {
-                if cameraManager.availableCameras.isEmpty {
-                    Text("No cameras").tag(nil as AVCaptureDevice?)
+            VStack(spacing: 8) {
+                // Video source
+                pickerRow(icon: "camera.fill", iconColor: .primary) {
+                    Picker("Camera", selection: $cameraManager.selectedCamera) {
+                        if cameraManager.availableCameras.isEmpty {
+                            Text("No cameras").tag(nil as AVCaptureDevice?)
+                        }
+                        ForEach(cameraManager.availableCameras, id: \.uniqueID) { device in
+                            Text(device.localizedName).tag(device as AVCaptureDevice?)
+                        }
+                    }
+                    .labelsHidden()
                 }
-                ForEach(cameraManager.availableCameras, id: \.uniqueID) { device in
-                    Text(device.localizedName).tag(device as AVCaptureDevice?)
+
+                // Video format
+                if !cameraManager.availableCameraModes.isEmpty {
+                    pickerRow(icon: "film", iconColor: .primary) {
+                        Picker("Format", selection: Binding(
+                            get: { cameraManager.currentCameraMode },
+                            set: { newMode in
+                                if let mode = newMode {
+                                    cameraManager.applyCameraMode(mode)
+                                }
+                            }
+                        )) {
+                            ForEach(cameraManager.availableCameraModes) { mode in
+                                Text(mode.label).tag(mode as CameraMode?)
+                            }
+                        }
+                        .labelsHidden()
+                    }
                 }
-            }
-            .labelsHidden()
-        }
-    }
 
-    // MARK: - Camera Mode Selection
-
-    private var cameraModeSection: some View {
-        Group {
-            if !cameraManager.availableCameraModes.isEmpty {
-                HStack(spacing: 8) {
-                    Image(systemName: "rectangle.dashed")
-                        .frame(width: 16)
-                        .foregroundStyle(.secondary)
-                    Picker("Format", selection: Binding(
-                        get: { cameraManager.currentCameraMode },
-                        set: { newMode in
-                            if let mode = newMode {
-                                cameraManager.applyCameraMode(mode)
+                // Audio source
+                pickerRow(
+                    icon: audioManager.isCameraAudioSelected ? "video.fill" : "mic.fill",
+                    iconColor: .primary
+                ) {
+                    Picker("Audio", selection: Binding(
+                        get: { AudioPickerOption.from(audioManager: audioManager) },
+                        set: { newValue in
+                            switch newValue {
+                            case .none:
+                                audioManager.selectMicrophone(nil)
+                            case .cameraAudio:
+                                audioManager.selectCameraAudio()
+                            case .microphone(let uniqueID):
+                                let device = audioManager.availableMics.first { $0.uniqueID == uniqueID }
+                                audioManager.selectMicrophone(device)
                             }
                         }
                     )) {
-                        ForEach(cameraManager.availableCameraModes) { mode in
-                            Text(mode.label).tag(mode as CameraMode?)
+                        Text("No audio").tag(AudioPickerOption.none)
+
+                        if let camAudio = audioManager.cameraAudioDevice {
+                            Text("\(Image(systemName: "video.fill")) Camera Audio (\(camAudio.localizedName))")
+                                .tag(AudioPickerOption.cameraAudio)
+                        }
+
+                        ForEach(audioManager.availableMics, id: \.uniqueID) { device in
+                            Text(device.localizedName)
+                                .tag(AudioPickerOption.microphone(device.uniqueID))
                         }
                     }
                     .labelsHidden()
+                }
+
+                // Audio error
+                if let error = audioManager.routingError {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption2)
+                        Text(error)
+                            .font(.caption2)
+                            .lineLimit(2)
+                    }
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 24)
                 }
             }
         }
     }
 
-    // MARK: - Display Selection
+    // MARK: - OUTPUT Section
 
-    private var displaySection: some View {
-        VStack(spacing: 4) {
-            HStack(spacing: 8) {
-                Image(systemName: "display")
-                    .frame(width: 16)
-                    .foregroundStyle(.secondary)
-                if displayManager.availableDisplays.isEmpty {
-                    Text("No external displays")
-                        .foregroundStyle(.tertiary)
-                        .font(.callout)
-                    Spacer()
-                } else {
-                    Picker("Display", selection: $displayManager.selectedDisplay) {
-                        ForEach(displayManager.availableDisplays) { display in
-                            Text(display.name).tag(display as ExternalDisplay?)
-                        }
-                    }
-                    .labelsHidden()
-                    .onChange(of: displayManager.selectedDisplay) {
-                        displayManager.refreshModes()
-                    }
-                }
-            }
+    private var outputSection: some View {
+        VStack(spacing: 0) {
+            // Section header
+            sectionHeader("OUTPUT", icon: "arrow.up.circle.fill", color: .green)
+                .padding(.bottom, 10)
 
-            if let selected = displayManager.selectedDisplay, selected.isMirroring {
-                HStack(spacing: 4) {
-                    Image(systemName: "rectangle.on.rectangle")
-                        .font(.caption2)
-                    Text("Mirroring will be stopped when projection starts")
-                        .font(.caption2)
-                }
-                .foregroundStyle(.orange)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.leading, 24)
-            }
-        }
-    }
-
-    // MARK: - Display Mode Picker
-
-    private var displayModeSection: some View {
-        Group {
-            if !displayManager.availableModes.isEmpty {
-                HStack(spacing: 8) {
-                    Image(systemName: "aspectratio")
-                        .frame(width: 16)
-                        .foregroundStyle(.secondary)
-                    Picker("Mode", selection: Binding(
-                        get: { displayManager.currentMode },
-                        set: { newMode in
-                            if let mode = newMode {
-                                displayManager.applyMode(mode)
+            VStack(spacing: 8) {
+                // Display picker
+                pickerRow(icon: "display", iconColor: .primary) {
+                    if displayManager.availableDisplays.isEmpty {
+                        Text("No external displays")
+                            .foregroundStyle(.tertiary)
+                            .font(.callout)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        Picker("Display", selection: $displayManager.selectedDisplay) {
+                            ForEach(displayManager.availableDisplays) { display in
+                                Text(display.name).tag(display as ExternalDisplay?)
                             }
                         }
-                    )) {
-                        ForEach(displayManager.availableModes) { mode in
-                            Text(mode.label).tag(mode as DisplayMode?)
+                        .labelsHidden()
+                        .onChange(of: displayManager.selectedDisplay) {
+                            displayManager.refreshModes()
                         }
                     }
-                    .labelsHidden()
                 }
-            }
-        }
-    }
 
-    // MARK: - Audio Section
-
-    private var audioSection: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: "mic.fill")
-                    .frame(width: 16)
-                    .foregroundStyle(.secondary)
-                Picker("Microphone", selection: $audioManager.selectedMic) {
-                    Text("No audio").tag(nil as AVCaptureDevice?)
-                    ForEach(audioManager.availableMics, id: \.uniqueID) { device in
-                        Text(device.localizedName).tag(device as AVCaptureDevice?)
+                // Display mode / resolution
+                if !displayManager.availableModes.isEmpty {
+                    pickerRow(icon: "aspectratio", iconColor: .primary) {
+                        Picker("Mode", selection: Binding(
+                            get: { displayManager.currentMode },
+                            set: { newMode in
+                                if let mode = newMode {
+                                    displayManager.applyMode(mode)
+                                }
+                            }
+                        )) {
+                            ForEach(displayManager.availableModes) { mode in
+                                Text(mode.label).tag(mode as DisplayMode?)
+                            }
+                        }
+                        .labelsHidden()
                     }
                 }
-                .labelsHidden()
-            }
 
-            if let error = audioManager.routingError {
-                HStack(spacing: 4) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.caption2)
-                    Text(error)
-                        .font(.caption2)
+                // Mirroring warning
+                if let selected = displayManager.selectedDisplay, selected.isMirroring {
+                    HStack(spacing: 4) {
+                        Image(systemName: "rectangle.on.rectangle")
+                            .font(.caption2)
+                        Text("Mirroring will be stopped when projection starts")
+                            .font(.caption2)
+                    }
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 24)
                 }
-                .foregroundStyle(.red)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.leading, 24)
+
+                // HDMI audio status when projecting
+                if displayManager.isProjecting && audioManager.isRouting {
+                    HStack(spacing: 6) {
+                        Image(systemName: "speaker.wave.2.fill")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.green)
+                            .frame(width: 16)
+                        Text("Audio routed to HDMI")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                }
             }
         }
     }
 
-    // MARK: - Rendering Section
+    // MARK: - Shared Components
 
-    private var renderingSection: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "memorychip.fill")
-                .frame(width: 16)
+    /// Section header with icon and label
+    private func sectionHeader(_ title: String, icon: String, color: Color) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(color)
+            Text(title)
+                .font(.system(size: 11, weight: .semibold, design: .default))
                 .foregroundStyle(.secondary)
-            Text("Native Preview Layer")
-                .font(.callout)
             Spacer()
+        }
+    }
+
+    /// Picker row with leading icon
+    private func pickerRow<Content: View>(
+        icon: String,
+        iconColor: Color = .secondary,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 11))
+                .frame(width: 16)
+                .foregroundStyle(iconColor == .primary ? .secondary : iconColor)
+            content()
         }
     }
 
@@ -333,7 +371,27 @@ struct MenuBarView: View {
         }
     }
 
-    // MARK: - Live Stats (isolated to prevent full-body redraw)
+    // MARK: - Audio Picker Option
+
+    /// Represents audio source options in the picker.
+    private enum AudioPickerOption: Hashable {
+        case none
+        case cameraAudio
+        case microphone(String) // uniqueID
+
+        static func from(audioManager: AudioManager) -> AudioPickerOption {
+            if audioManager.selectedMic == nil {
+                return .none
+            } else if audioManager.isCameraAudioSelected {
+                return .cameraAudio
+            } else if let mic = audioManager.selectedMic {
+                return .microphone(mic.uniqueID)
+            }
+            return .none
+        }
+    }
+
+    // MARK: - Audio Level Indicator (isolated to prevent full-body redraw)
 
     /// Isolated view that only redraws when inputLevel changes.
     /// Prevents the entire MenuBarView body from re-evaluating on level updates.

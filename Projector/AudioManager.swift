@@ -4,23 +4,27 @@
 //
 //  Created by Sibidharan on 20/02/26.
 //
-//  Low-latency audio passthrough from microphone to HDMI output.
+//  Ultra-low-latency audio passthrough from microphone (or camera audio) to HDMI output.
 //
 //  Architecture:
 //  ─────────────
-//  1. Create an Aggregate Device combining mic (input) + HDMI (output)
-//     with drift compensation enabled for clock synchronization.
-//  2. Set the smallest possible I/O buffer size on both devices.
+//  1. Create an Aggregate Device combining mic (input) + HDMI (output).
+//     Input device is the CLOCK MASTER — drives callback timing for minimum
+//     input latency. Drift compensation is on the output (non-master) side.
+//  2. Set the SMALLEST possible I/O buffer on all devices (typically 64 samples
+//     = 1.3ms at 48kHz). CPU is fine because metering only runs when visible.
 //  3. HAL AudioUnit with a lightweight render callback that pulls mic data
 //     from bus 1 and passes it through to bus 0 (HDMI). Zero processing —
 //     just a direct passthrough for minimum latency.
-//  4. Level metering is throttled to every 32nd callback (~6/sec at 256 samples)
-//     and quantized to 8 visual steps — only triggers SwiftUI redraw when the
-//     visible bar count actually changes. Uses coalesced DispatchQueue instead
-//     of per-update Task allocations.
-//  5. Virtual mic detection — skips drift compensation for software mics
+//  4. Level metering is ONLY active when the menu popover is visible.
+//     When hidden, the render callback skips RMS entirely (zero overhead).
+//     When visible, metering is throttled to every 256th callback (~3/sec).
+//  5. Camera audio detection — finds the companion audio device for capture
+//     cards (matched by modelID). Skips drift compensation since camera audio
+//     and video share the same USB clock for perfect lip sync.
+//  6. Virtual mic detection — skips drift compensation for software mics
 //     (BoomAudio, OBS, BlackHole) since they share the system clock.
-//  6. Channel count matching — uses min(input, output) channels to avoid
+//  7. Channel count matching — uses min(input, output) channels to avoid
 //     expensive multi-channel mixdown (e.g., 6ch BoomAudio → 2ch HDMI).
 //
 
@@ -43,6 +47,10 @@ final class AudioManager: ObservableObject {
     @Published var inputLevel: Float = 0
     @Published var routingError: String?
 
+    // Camera audio — detected companion audio device for the current camera
+    @Published var cameraAudioDevice: AVCaptureDevice?
+    @Published var isCameraAudioSelected: Bool = false
+
     // We need to store both the aggregate device and the current output device
     // so we can restart routing when the mic changes
     nonisolated(unsafe) var audioUnit: AudioUnit?
@@ -50,13 +58,16 @@ final class AudioManager: ObservableObject {
     private var currentOutputDeviceID: AudioDeviceID = 0
     private var deviceObservers: [NSObjectProtocol] = []
 
-    // Level metering — throttle counter (accessed on audio thread)
+    // Level metering — only active when the menu popover is visible.
+    // When hidden, the render callback skips RMS computation entirely,
+    // saving CPU cycles on the real-time audio thread.
+    nonisolated(unsafe) var _meterEnabled: Bool = false
     nonisolated(unsafe) var _meterCounter: Int32 = 0
-    // Coalesce level updates to main thread — avoid spawning Task per update
-    nonisolated(unsafe) var _pendingLevelUpdate = false
     nonisolated(unsafe) var _pendingLevel: Float = 0
-    // Track last quantized level to skip no-op UI updates
-    nonisolated(unsafe) var _lastQuantizedLevel: Int32 = -1
+
+    // Audio error tracking — consecutive render errors trigger recovery
+    nonisolated(unsafe) var _renderErrorCount: Int32 = 0
+    private var audioRecoveryTimer: Timer?
 
     init() {
         refreshMicList()
@@ -77,11 +88,91 @@ final class AudioManager: ObservableObject {
             mediaType: .audio,
             position: .unspecified
         )
-        availableMics = discovery.devices
+        // Filter out our own aggregate devices — they appear in the discovery
+        // session and cause Picker tag mismatches if selected.
+        availableMics = discovery.devices.filter {
+            !$0.uniqueID.hasPrefix("com.projector.aggregate.")
+        }
 
-        if selectedMic == nil, let first = availableMics.first {
+        if selectedMic == nil && !isCameraAudioSelected, let first = availableMics.first {
             selectedMic = first
         }
+
+        // Re-validate camera audio device still exists
+        if let cameraAudio = cameraAudioDevice,
+           !discovery.devices.contains(where: { $0.uniqueID == cameraAudio.uniqueID }) {
+            cameraAudioDevice = nil
+            if isCameraAudioSelected {
+                isCameraAudioSelected = false
+                selectedMic = availableMics.first
+            }
+        }
+    }
+
+    // MARK: - Camera Audio Detection
+
+    /// Finds the audio AVCaptureDevice that belongs to the same hardware as the given camera.
+    /// Capture cards (USB) expose separate video and audio AVCaptureDevices with the same modelID.
+    func updateCameraAudioDevice(for camera: AVCaptureDevice?) {
+        guard let camera = camera else {
+            cameraAudioDevice = nil
+            if isCameraAudioSelected {
+                isCameraAudioSelected = false
+                selectedMic = availableMics.first
+            }
+            return
+        }
+
+        let audioDiscovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.microphone, .external],
+            mediaType: .audio,
+            position: .unspecified
+        )
+        // Filter out our own aggregate devices
+        let audioDevices = audioDiscovery.devices.filter {
+            !$0.uniqueID.hasPrefix("com.projector.aggregate.")
+        }
+
+        // Primary match: same modelID (most reliable — same hardware shares modelID)
+        if let match = audioDevices.first(where: {
+            $0.modelID == camera.modelID && $0.uniqueID != camera.uniqueID
+        }) {
+            cameraAudioDevice = match
+            print("[Audio] Camera audio detected: \(match.localizedName) (modelID: \(match.modelID))")
+            return
+        }
+
+        // Fallback: name-based matching (mutual containment)
+        let cameraName = camera.localizedName.lowercased()
+        if let match = audioDevices.first(where: {
+            let audioName = $0.localizedName.lowercased()
+            return audioName.contains(cameraName) || cameraName.contains(audioName)
+        }) {
+            cameraAudioDevice = match
+            print("[Audio] Camera audio detected (name match): \(match.localizedName)")
+            return
+        }
+
+        // No companion audio device found
+        cameraAudioDevice = nil
+        if isCameraAudioSelected {
+            print("[Audio] Camera audio lost, falling back to mic")
+            isCameraAudioSelected = false
+            selectedMic = availableMics.first
+        }
+    }
+
+    /// Select the camera's companion audio device as the audio source.
+    func selectCameraAudio() {
+        guard let device = cameraAudioDevice else { return }
+        isCameraAudioSelected = true
+        selectedMic = device
+    }
+
+    /// Select a regular microphone as the audio source.
+    func selectMicrophone(_ mic: AVCaptureDevice?) {
+        isCameraAudioSelected = false
+        selectedMic = mic
     }
 
     // MARK: - Audio Routing via Aggregate Device + HAL AudioUnit
@@ -116,9 +207,11 @@ final class AudioManager: ObservableObject {
             return
         }
 
-        // Check if input is a virtual device (same machine = same clock = no drift)
+        // Camera audio shares the same USB clock as the video — no drift compensation.
+        // Virtual devices (BoomAudio, OBS, etc.) share the system clock — also no drift.
         let isVirtualInput = isVirtualDevice(inputDeviceID)
-        print("[Audio] Input device: \(mic.localizedName) (UID: \(inputUID), ID: \(inputDeviceID), virtual: \(isVirtualInput))")
+        let skipDriftCompensation = isCameraAudioSelected || isVirtualInput
+        print("[Audio] Input device: \(mic.localizedName) (UID: \(inputUID), ID: \(inputDeviceID), virtual: \(isVirtualInput), cameraAudio: \(isCameraAudioSelected))")
         print("[Audio] Output device ID: \(outputDeviceID) (UID: \(outputUID))")
 
         // Step 1.5: Set minimum buffer size on both hardware devices
@@ -126,19 +219,19 @@ final class AudioManager: ObservableObject {
         setMinimumBufferSize(for: outputDeviceID)
 
         // Step 2: Create an Aggregate Device combining input + output
-        // Virtual devices (BoomAudio, OBS, etc.) share the system clock,
-        // so drift compensation is unnecessary and adds latency.
+        // Skip drift compensation for camera audio (same USB clock) and
+        // virtual devices (same system clock) to avoid unnecessary latency.
         let aggregateResult = createAggregateDevice(
             inputUID: inputUID,
             outputUID: outputUID,
-            enableDriftCompensation: !isVirtualInput
+            enableDriftCompensation: !skipDriftCompensation
         )
         guard let aggDeviceID = aggregateResult else {
             routingError = "Cannot create aggregate device"
             return
         }
         self.aggregateDeviceID = aggDeviceID
-        print("[Audio] Aggregate device created: \(aggDeviceID) (drift comp: \(!isVirtualInput))")
+        print("[Audio] Aggregate device created: \(aggDeviceID) (drift comp: \(!skipDriftCompensation))")
 
         // Also set minimum buffer size on the aggregate device itself
         setMinimumBufferSize(for: aggDeviceID)
@@ -291,18 +384,35 @@ final class AudioManager: ObservableObject {
         }
 
         self.audioUnit = unit
+        self._renderErrorCount = 0
         isRouting = true
+        startAudioHealthCheck()
 
-        // Log the achieved latency
+        // Log the achieved latency — comprehensive breakdown
         let bufferSize = getBufferSize(for: aggDeviceID)
-        let latencyMs = Double(bufferSize) / sampleRate * 1000.0
+        let bufferMs = Double(bufferSize) / sampleRate * 1000.0
 
-        // Also query the device's stream latency for a complete picture
         let inputLatency = getDeviceLatency(for: inputDeviceID, scope: kAudioDevicePropertyScopeInput)
         let outputLatency = getDeviceLatency(for: outputDeviceID, scope: kAudioDevicePropertyScopeOutput)
-        let totalLatencyMs = latencyMs + (Double(inputLatency + outputLatency) / sampleRate * 1000.0)
-        print("[Audio] Routing started — buffer: \(bufferSize) samples (\(String(format: "%.1f", latencyMs))ms)")
-        print("[Audio] Total estimated latency: \(String(format: "%.1f", totalLatencyMs))ms (buf: \(String(format: "%.1f", latencyMs))ms + device: \(inputLatency + outputLatency) frames)")
+        let inputSafety = getDeviceSafetyOffset(for: inputDeviceID, scope: kAudioDevicePropertyScopeInput)
+        let outputSafety = getDeviceSafetyOffset(for: outputDeviceID, scope: kAudioDevicePropertyScopeOutput)
+
+        let inputBufferSize = getBufferSize(for: inputDeviceID)
+        let outputBufferSize = getBufferSize(for: outputDeviceID)
+
+        let totalFrames = bufferSize + inputLatency + outputLatency + inputSafety + outputSafety
+        let totalMs = Double(totalFrames) / sampleRate * 1000.0
+
+        print("[Audio] ═══ Latency Breakdown ═══")
+        print("[Audio] Input buffer: \(inputBufferSize) samples (\(String(format: "%.1f", Double(inputBufferSize)/sampleRate*1000))ms)")
+        print("[Audio] Output buffer: \(outputBufferSize) samples (\(String(format: "%.1f", Double(outputBufferSize)/sampleRate*1000))ms)")
+        print("[Audio] Aggregate buffer: \(bufferSize) samples (\(String(format: "%.1f", bufferMs))ms)")
+        print("[Audio] Input device latency: \(inputLatency) frames (\(String(format: "%.1f", Double(inputLatency)/sampleRate*1000))ms)")
+        print("[Audio] Output device latency: \(outputLatency) frames (\(String(format: "%.1f", Double(outputLatency)/sampleRate*1000))ms)")
+        print("[Audio] Input safety offset: \(inputSafety) frames (\(String(format: "%.1f", Double(inputSafety)/sampleRate*1000))ms)")
+        print("[Audio] Output safety offset: \(outputSafety) frames (\(String(format: "%.1f", Double(outputSafety)/sampleRate*1000))ms)")
+        print("[Audio] Total estimated: \(String(format: "%.1f", totalMs))ms (\(totalFrames) frames @ \(sampleRate)Hz)")
+        print("[Audio] ═════════════════════════")
     }
 
     private func describeASBD(_ asbd: AudioStreamBasicDescription) -> String {
@@ -312,6 +422,7 @@ final class AudioManager: ObservableObject {
     }
 
     func stopRouting() {
+        stopAudioHealthCheck()
         if let unit = audioUnit {
             AudioOutputUnitStop(unit)
             AudioUnitUninitialize(unit)
@@ -333,9 +444,9 @@ final class AudioManager: ObservableObject {
 
     // MARK: - Buffer Size Management
 
-    /// Set a low I/O buffer size on a device.
-    /// 256 samples at 48kHz = ~5.3ms — very low latency.
-    /// CPU overhead is manageable after the metering/Task optimizations.
+    /// Set the lowest possible I/O buffer size on a device for minimum latency.
+    /// Smaller buffers = lower latency but more CPU. Since metering is conditional
+    /// (only when popover visible), we can afford very small buffers.
     private func setMinimumBufferSize(for deviceID: AudioDeviceID) {
         // Get the allowed buffer size range
         var rangeAddress = AudioObjectPropertyAddress(
@@ -347,13 +458,15 @@ final class AudioManager: ObservableObject {
         var rangeSize = UInt32(MemoryLayout<AudioValueRange>.size)
         let rangeStatus = AudioObjectGetPropertyData(deviceID, &rangeAddress, 0, nil, &rangeSize, &range)
 
-        // Target 256 samples (~5.3ms at 48kHz) — low latency.
-        // The CPU optimizations (coalesced dispatch, quantized metering,
-        // reduced callback overhead) give us headroom for smaller buffers.
-        var targetSize: UInt32 = 256
+        // Target the SMALLEST buffer the hardware supports.
+        // USB capture cards typically support 64-128 samples minimum.
+        // 64 samples @ 48kHz = 1.3ms, 128 = 2.7ms, 256 = 5.3ms.
+        // CPU is fine because metering only runs when popover is visible.
+        var targetSize: UInt32 = 64
         if rangeStatus == noErr {
             targetSize = max(targetSize, UInt32(range.mMinimum))
             targetSize = min(targetSize, UInt32(range.mMaximum))
+            print("[Audio] Buffer range for device \(deviceID): \(UInt32(range.mMinimum))–\(UInt32(range.mMaximum)), using \(targetSize)")
         }
 
         // Set the buffer size
@@ -385,10 +498,16 @@ final class AudioManager: ObservableObject {
     // MARK: - Aggregate Device Management
 
     private func createAggregateDevice(inputUID: String, outputUID: String, enableDriftCompensation: Bool) -> AudioDeviceID? {
-        // Drift compensation adds a resampling buffer for clock sync.
-        // Virtual devices (BoomAudio, OBS, BlackHole) share the system
-        // clock, so drift comp is unnecessary and adds ~1 buffer of latency.
-        // Hardware mics have their own clock and DO need drift comp.
+        // The INPUT device is the clock master — this minimizes input latency
+        // because the audio callback fires in sync with the input hardware clock.
+        // The output (HDMI) adapts to the input timing via drift compensation.
+        //
+        // Drift compensation goes on the OUTPUT (non-master) sub-device.
+        // When clocks differ, the output resamples to match the input clock.
+        // This keeps input latency at zero extra frames while output adapts.
+        //
+        // For camera audio or virtual devices, clocks are shared so we
+        // skip drift comp entirely (avoids ~1 buffer of resampling latency).
         let aggregateDict: [String: Any] = [
             kAudioAggregateDeviceNameKey as String: "Projector Audio Bridge",
             kAudioAggregateDeviceUIDKey as String: "com.projector.aggregate.\(UUID().uuidString)",
@@ -396,14 +515,14 @@ final class AudioManager: ObservableObject {
             kAudioAggregateDeviceIsStackedKey as String: false,
             kAudioAggregateDeviceSubDeviceListKey as String: [
                 [
-                    kAudioSubDeviceUIDKey as String: inputUID,
-                    kAudioSubDeviceDriftCompensationKey as String: enableDriftCompensation
+                    kAudioSubDeviceUIDKey as String: inputUID
                 ] as [String : Any],
                 [
-                    kAudioSubDeviceUIDKey as String: outputUID
+                    kAudioSubDeviceUIDKey as String: outputUID,
+                    kAudioSubDeviceDriftCompensationKey as String: enableDriftCompensation
                 ] as [String : Any]
             ],
-            kAudioAggregateDeviceMasterSubDeviceKey as String: outputUID
+            kAudioAggregateDeviceMasterSubDeviceKey as String: inputUID
         ]
 
         var aggregateID: AudioDeviceID = 0
@@ -446,6 +565,19 @@ final class AudioManager: ObservableObject {
         var size = UInt32(MemoryLayout<UInt32>.size)
         AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &latency)
         return latency
+    }
+
+    /// Get the device's safety offset in frames (additional latency Apple adds for stability).
+    private func getDeviceSafetyOffset(for deviceID: AudioDeviceID, scope: AudioObjectPropertyScope) -> UInt32 {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertySafetyOffset,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var offset: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &offset)
+        return offset
     }
 
     private func destroyAggregateDevice() {
@@ -565,27 +697,38 @@ final class AudioManager: ObservableObject {
         return results
     }
 
+    // MARK: - Audio Routing Recovery
+
+    /// Start a timer that checks for render callback errors.
+    /// When the aggregate device is destroyed by the system (GPU purge, device disconnect),
+    /// the render callback returns errors. After enough consecutive errors, we restart routing.
+    private func startAudioHealthCheck() {
+        stopAudioHealthCheck()
+        audioRecoveryTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isRouting else { return }
+                if self._renderErrorCount > 10 {
+                    print("[Audio] Render errors detected (\(self._renderErrorCount)), restarting routing")
+                    self._renderErrorCount = 0
+                    self.restartRouting()
+                }
+            }
+        }
+    }
+
+    private func stopAudioHealthCheck() {
+        audioRecoveryTimer?.invalidate()
+        audioRecoveryTimer = nil
+    }
+
     // MARK: - Level Metering (called from render callback)
 
-    /// Called from the real-time audio thread. Coalesces updates to avoid
-    /// spawning a Task per callback — uses a single pending dispatch.
-    /// Also quantizes to 8 visual steps so SwiftUI only redraws when
-    /// the visible bar count actually changes.
+    /// Called from the real-time audio thread ~6 times/sec (every 32nd callback).
+    /// Dispatches to main thread for SwiftUI update.
     nonisolated func updateLevel(_ rms: Float) {
-        // Quantize to 8 steps (matching the 8-bar display)
-        let scaled = min(rms * 5, 1.0)
-        let quantized = Int32(scaled * 8)
-        // Skip if the visual output hasn't changed
-        guard quantized != _lastQuantizedLevel else { return }
-        _lastQuantizedLevel = quantized
         _pendingLevel = rms
-
-        // Coalesce — only dispatch if no pending update
-        guard !_pendingLevelUpdate else { return }
-        _pendingLevelUpdate = true
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self._pendingLevelUpdate = false
             self.inputLevel = self._pendingLevel
         }
     }
@@ -649,23 +792,28 @@ nonisolated private func audioPassthroughCallback(
     )
 
     guard status == noErr else {
+        // Track consecutive errors — the health check timer will restart routing
+        manager._renderErrorCount &+= 1
         return status
     }
 
-    // Throttled level metering — only compute RMS every 32nd callback
-    // At 256 samples / 48kHz, each callback is ~5.3ms, so metering updates ~every 170ms (~6/sec)
-    // Quantized to 8 steps so SwiftUI only redraws when the visible bar changes
+    // Reset error count on success
+    manager._renderErrorCount = 0
+
+    // Level metering — only when menu popover is visible.
+    // Skips all RMS computation when hidden to save CPU.
+    guard manager._meterEnabled else { return noErr }
     manager._meterCounter &+= 1
-    if manager._meterCounter & 31 == 0 {
+    // With small buffers (64 samples), callbacks fire ~750/sec at 48kHz.
+    // Mask 0xFF = every 256th callback ≈ ~3 updates/sec — smooth enough for a meter.
+    if manager._meterCounter & 0xFF == 0 {
         let buffers = UnsafeMutableAudioBufferListPointer(ioData)
         if let firstBuffer = buffers.first, let data = firstBuffer.mData {
             let floatData = data.assumingMemoryBound(to: Float.self)
             let count = min(Int(firstBuffer.mDataByteSize) / MemoryLayout<Float>.size,
                            Int(inNumberFrames))
-            // Use Accelerate-style manual loop for RMS (no import needed)
             var sum: Float = 0
             var i = 0
-            // Process 4 samples at a time for better pipelining
             let count4 = count & ~3
             while i < count4 {
                 let s0 = floatData[i]

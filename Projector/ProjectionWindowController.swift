@@ -17,16 +17,19 @@
 //  No manual IOSurface handling, no Metal, no frame drops.
 //
 //  Recovery:
-//  Two failure modes are handled:
-//  1. GPU resource purge — Mission Control / Space switch triggers
+//  Three failure modes are handled:
+//  1. GPU resource purge via Space switch — Mission Control / Space switch triggers
 //     [_MTLDevice _purgeDevice], invalidating preview layer GPU textures.
 //     Detected via NSWorkspace.activeSpaceDidChangeNotification.
-//  2. Silent preview layer disconnect — The session runs fine and frames
+//     Triple rebuild at 300ms/2000ms/4000ms to cover particle animation timeline.
+//  2. GPU resource purge via system overlays — macOS Tahoe particle effects
+//     (confetti, balloons, fireworks, hearts, lasers) can trigger GPU purges
+//     WITHOUT a space change. Detected via didChangeOcclusionStateNotification.
+//  3. Silent preview layer disconnect — The session runs fine and frames
 //     arrive to the heartbeat output, but the preview layer's internal
-//     connection goes stale. Detected by a health-check timer that
-//     inspects the preview layer's connection state every 2 seconds.
+//     connection goes stale. Detected by a health-check timer every 1 second.
 //
-//  Both are fixed by rebuilding the preview layer from scratch
+//  All are fixed by rebuilding the preview layer from scratch
 //  with zero blackout (new view replaces old in a single assignment).
 //
 
@@ -42,6 +45,7 @@ final class ProjectionWindowController {
     private var screenObserver: NSObjectProtocol?
     private var spaceObserver: NSObjectProtocol?
     private var appActivateObserver: NSObjectProtocol?
+    private var occlusionObserver: NSObjectProtocol?
     private var mouseEventMonitor: Any?
     private var pendingMouseConstrain = false
 
@@ -247,7 +251,7 @@ final class ProjectionWindowController {
     /// to the heartbeat output, but the preview layer silently disconnects.
     private func startHealthCheck() {
         stopHealthCheck()
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             // Timer fires on main RunLoop — we're already on main thread.
             // Use assumeIsolated to avoid Task allocation overhead.
             MainActor.assumeIsolated {
@@ -356,6 +360,35 @@ final class ProjectionWindowController {
                 // Ensure window is on top and rebuild preview after app activation
                 self.window?.orderFrontRegardless()
                 self.rebuildPreviewLayer()
+            }
+        }
+
+        // Occlusion state change — fires when Mission Control overlays/exits,
+        // fullscreen transitions, or other system overlays occlude/reveal the app.
+        // GPU purges from particle effects (confetti, balloons, fireworks, hearts,
+        // lasers) can happen WITHOUT a space change, so this catches cases that
+        // activeSpaceDidChangeNotification misses.
+        occlusionObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeOcclusionStateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.isProjectionActive else { return }
+                let isVisible = NSApp.occlusionState.contains(.visible)
+                if isVisible {
+                    // App just became visible again — GPU resources may have been purged
+                    print("[Window] App became visible, scheduling preview rebuilds")
+                    self.window?.orderFrontRegardless()
+
+                    // Immediate rebuild
+                    self.rebuildPreviewLayer()
+
+                    // Delayed rebuild — catch late GPU purges from finishing animations
+                    try? await Task.sleep(for: .milliseconds(1000))
+                    guard self.isProjectionActive else { return }
+                    self.rebuildPreviewLayer()
+                }
             }
         }
     }
@@ -483,6 +516,10 @@ final class ProjectionWindowController {
         if let observer = appActivateObserver {
             NotificationCenter.default.removeObserver(observer)
             appActivateObserver = nil
+        }
+        if let observer = occlusionObserver {
+            NotificationCenter.default.removeObserver(observer)
+            occlusionObserver = nil
         }
     }
 
