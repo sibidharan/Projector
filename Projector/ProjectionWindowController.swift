@@ -7,30 +7,23 @@
 //  Manages a borderless fullscreen window on the external display.
 //
 //  Uses AVCaptureVideoPreviewLayer for native-quality rendering.
-//  This is Apple's own optimized path — the same one used by FaceTime,
-//  Photo Booth, and QuickTime. It handles:
-//    - Zero-copy GPU texture sharing from the camera
-//    - VSync-aligned presentation
-//    - Display refresh rate matching
-//    - Color space management
-//    - Hardware scaling
-//  No manual IOSurface handling, no Metal, no frame drops.
+//  This is Apple's own optimized path — zero-copy GPU texture sharing,
+//  VSync-aligned presentation, hardware scaling.
 //
-//  Recovery:
-//  Three failure modes are handled:
-//  1. GPU resource purge via Space switch — Mission Control / Space switch triggers
-//     [_MTLDevice _purgeDevice], invalidating preview layer GPU textures.
-//     Detected via NSWorkspace.activeSpaceDidChangeNotification.
-//     Triple rebuild at 300ms/2000ms/4000ms to cover particle animation timeline.
-//  2. GPU resource purge via system overlays — macOS Tahoe particle effects
-//     (confetti, balloons, fireworks, hearts, lasers) can trigger GPU purges
-//     WITHOUT a space change. Detected via didChangeOcclusionStateNotification.
-//  3. Silent preview layer disconnect — The session runs fine and frames
-//     arrive to the heartbeat output, but the preview layer's internal
-//     connection goes stale. Detected by a health-check timer every 1 second.
+//  Mission Control / Stage Manager recovery:
+//  ─────────────────────────────────────────
+//  macOS Tahoe's Mission Control can trigger [_MTLDevice _purgeDevice] which
+//  corrupts the preview layer's GPU textures. The layer goes black but its
+//  connection still reports "active" — so we can't detect it via connection state.
 //
-//  All are fixed by rebuilding the preview layer from scratch
-//  with zero blackout (new view replaces old in a single assignment).
+//  Recovery strategy: SIMPLE and SAFE.
+//  - On space change or becoming visible: wait for animations to finish, then
+//    do a SINGLE rebuild by detaching and reattaching the session on the same layer.
+//  - No new views, no contentView swaps, no complex state machines.
+//  - Just: previewLayer.session = nil → delay → previewLayer.session = session
+//  - This forces AVFoundation to recreate its internal GPU pipeline cleanly.
+//  - A single Task handles recovery — if another space change fires while
+//    we're waiting, the guard prevents re-entry.
 //
 
 import AppKit
@@ -44,12 +37,11 @@ final class ProjectionWindowController {
     private var contentView: PreviewBackedView?
     private var screenObserver: NSObjectProtocol?
     private var spaceObserver: NSObjectProtocol?
-    private var appActivateObserver: NSObjectProtocol?
     private var occlusionObserver: NSObjectProtocol?
     private var mouseEventMonitor: Any?
     private var pendingMouseConstrain = false
 
-    // Health check timer — detects silent preview layer disconnects
+    // Health check timer — catches session disconnects
     private var healthTimer: Timer?
 
     // Keep reference for reconfiguration
@@ -61,14 +53,8 @@ final class ProjectionWindowController {
     private var takenOverDisplayID: CGDirectDisplayID = 0
     private var isProjectionActive = false
 
-    // Recovery state
-    private var isRebuilding = false
-
-    // Track the last time the preview layer was rebuilt, to avoid excessive rebuilds
-    private var lastRebuildTime: CFTimeInterval = 0
-
-    // Track when the preview layer was last attached, to know its "age"
-    private var previewLayerAttachedTime: CFTimeInterval = 0
+    // Recovery state — prevents overlapping recoveries
+    private var isRecovering = false
 
     // MARK: - Projection Control
 
@@ -88,7 +74,7 @@ final class ProjectionWindowController {
 
         self.isProjectionActive = true
         observeScreenDisconnect(cameraManager: cameraManager)
-        observeSpaceChanges()
+        observeSpaceAndVisibility()
         startMouseConfinement()
         startHealthCheck()
 
@@ -97,6 +83,7 @@ final class ProjectionWindowController {
 
     func stopProjection(cameraManager: CameraManager? = nil) {
         isProjectionActive = false
+        isRecovering = false
         stopHealthCheck()
         stopMouseConfinement()
         removeObservers()
@@ -146,27 +133,18 @@ final class ProjectionWindowController {
         projectionWindow.hidesOnDeactivate = false
         projectionWindow.canHide = false
         projectionWindow.isMovable = false
+        projectionWindow.animationBehavior = .none
 
         self.window = projectionWindow
 
         // Build and attach the preview layer
-        attachPreviewLayer(to: projectionWindow, session: cameraManager.captureSession)
-
-        projectionWindow.setFrame(frame, display: true)
-        projectionWindow.orderFrontRegardless()
-    }
-
-    /// Build a fresh PreviewBackedView + AVCaptureVideoPreviewLayer and attach to the window.
-    private func attachPreviewLayer(to window: NSWindow, session: AVCaptureSession) {
-        let frame = window.frame
         let view = PreviewBackedView(frame: NSRect(origin: .zero, size: frame.size))
         view.autoresizingMask = [.width, .height]
 
         let preview = view.previewLayer
-        preview.session = session
+        preview.session = cameraManager.captureSession
         preview.videoGravity = .resizeAspect
 
-        // Configure connection
         if let connection = preview.connection {
             if connection.isVideoMirroringSupported {
                 connection.automaticallyAdjustsVideoMirroring = false
@@ -174,88 +152,71 @@ final class ProjectionWindowController {
             }
         }
 
-        window.contentView = view
+        projectionWindow.contentView = view
         self.contentView = view
-        self.previewLayerAttachedTime = CACurrentMediaTime()
+
+        projectionWindow.setFrame(frame, display: true)
+        projectionWindow.orderFrontRegardless()
 
         print("[Window] PreviewLayer attached, connection active: \(preview.connection?.isActive ?? false)")
     }
 
     // MARK: - Preview Layer Recovery
 
-    /// Rebuild the preview layer from scratch.
-    /// Called when the existing preview layer's GPU resources are corrupted
-    /// or its connection has gone stale. Creates an entirely new
-    /// PreviewBackedView + AVCaptureVideoPreviewLayer to guarantee
-    /// a clean GPU pipeline.
+    /// Rebuild the preview layer by detaching and reattaching the session.
+    /// This forces AVFoundation to recreate its internal GPU pipeline.
     ///
-    /// Has a minimum 500ms cooldown between rebuilds to avoid thrashing.
+    /// This is the ONLY recovery mechanism. It's simple and safe:
+    /// - No new views or contentView swaps (those cause black frame flashes)
+    /// - Just nil the session, wait a beat, reassign it
+    /// - AVFoundation handles the rest internally
     func rebuildPreviewLayer() {
-        guard isProjectionActive, !isRebuilding else { return }
-        guard let window = self.window, let camera = activeCameraManager else { return }
+        guard isProjectionActive, !isRecovering else { return }
+        guard let preview = contentView?.previewLayer,
+              let camera = activeCameraManager else { return }
 
-        // Cooldown — don't rebuild more than once per 500ms
-        let now = CACurrentMediaTime()
-        if now - lastRebuildTime < 0.5 { return }
-
-        isRebuilding = true
-        lastRebuildTime = now
+        isRecovering = true
         let session = camera.captureSession
 
-        print("[Window] Rebuilding preview layer (fresh GPU pipeline)")
+        print("[Window] Recovering preview layer (session detach/reattach)")
 
-        // IMPORTANT: Do NOT nil the old view's session before the new view is ready.
-        // That causes a black frame flash because the window briefly shows a view
-        // with no session. Instead:
-        //   1. Build the new view and connect its preview layer to the session
-        //   2. Swap window.contentView (atomic — old view removed, new view shown)
-        //   3. THEN disconnect the old view's session
-        // This way there is never a frame where the visible view has no session.
+        // Detach session from preview layer
+        preview.session = nil
 
-        let oldView = contentView
-
-        // 1. Build fresh preview layer with session already connected
-        let frame = window.frame
-        let newView = PreviewBackedView(frame: NSRect(origin: .zero, size: frame.size))
-        newView.autoresizingMask = [.width, .height]
-
-        let preview = newView.previewLayer
-        preview.session = session
-        preview.videoGravity = .resizeAspect
-
-        if let connection = preview.connection {
-            if connection.isVideoMirroringSupported {
-                connection.automaticallyAdjustsVideoMirroring = false
-                connection.isVideoMirrored = false
+        // Brief delay to let AVFoundation release GPU resources
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(100))
+            guard let self, self.isProjectionActive else {
+                self?.isRecovering = false
+                return
             }
+
+            // Reattach session — AVFoundation creates fresh GPU pipeline
+            preview.session = session
+
+            // Reconfigure connection
+            if let connection = preview.connection {
+                if connection.isVideoMirroringSupported {
+                    connection.automaticallyAdjustsVideoMirroring = false
+                    connection.isVideoMirrored = false
+                }
+            }
+
+            self.window?.orderFrontRegardless()
+            self.isRecovering = false
+            print("[Window] Preview layer recovered, connection active: \(preview.connection?.isActive ?? false)")
         }
-
-        // 2. Atomic swap — new view replaces old in a single
-        //    contentView assignment. The window never shows a sessionless view.
-        window.contentView = newView
-        self.contentView = newView
-        self.previewLayerAttachedTime = CACurrentMediaTime()
-        window.orderFrontRegardless()
-
-        // 3. NOW disconnect the old view (it's no longer visible)
-        oldView?.previewLayer.session = nil
-
-        self.isRebuilding = false
-        print("[Window] Preview layer rebuilt, connection active: \(preview.connection?.isActive ?? false)")
     }
 
-    // MARK: - Preview Layer Health Check
+    // MARK: - Health Check
 
     /// Periodically verify the preview layer's connection is alive.
-    /// Catches the case where the session runs fine and frames arrive
-    /// to the heartbeat output, but the preview layer silently disconnects.
+    /// If session or connection is lost, trigger recovery.
     private func startHealthCheck() {
         stopHealthCheck()
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            // Timer fires on main RunLoop — we're already on main thread.
-            // Use assumeIsolated to avoid Task allocation overhead.
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.checkPreviewLayerHealth()
+                self?.checkHealth()
             }
         }
     }
@@ -265,61 +226,40 @@ final class ProjectionWindowController {
         healthTimer = nil
     }
 
-    private func checkPreviewLayerHealth() {
-        guard isProjectionActive, !isRebuilding else { return }
+    private func checkHealth() {
+        guard isProjectionActive, !isRecovering else { return }
         guard let preview = contentView?.previewLayer else {
-            // No preview layer at all — rebuild
-            print("[Window] Health: no preview layer, rebuilding")
-            rebuildPreviewLayer()
+            print("[Window] Health: no preview layer")
             return
         }
 
-        // Check 1: Does the preview layer have a session?
+        // Check session
         guard preview.session != nil else {
-            print("[Window] Health: session nil on preview layer, rebuilding")
+            print("[Window] Health: session nil, recovering")
             rebuildPreviewLayer()
             return
         }
 
-        // Check 2: Is the connection active?
-        // When AVFoundation drops the connection, connection becomes nil
-        // or connection.isActive becomes false.
+        // Check connection
         if let connection = preview.connection {
             if !connection.isActive || !connection.isEnabled {
-                print("[Window] Health: connection inactive/disabled, rebuilding")
+                print("[Window] Health: connection inactive/disabled, recovering")
                 rebuildPreviewLayer()
                 return
             }
         } else {
-            // No connection at all — the preview layer lost its link to the session
-            print("[Window] Health: no connection on preview layer, rebuilding")
+            print("[Window] Health: no connection, recovering")
             rebuildPreviewLayer()
             return
         }
-
-        // Note: We don't do preventive rebuilds based on layer age.
-        // That causes unnecessary flicker when the projection is working fine.
-        // The space change observer (triple rebuild at 300ms/2000ms/4000ms)
-        // and the connection checks above are sufficient to catch real problems.
     }
 
-    // MARK: - Space / Mission Control Observation
+    // MARK: - Space / Mission Control / Stage Manager Observation
 
-    /// Observe workspace active space changes.
-    /// Mission Control and Space switches trigger [_MTLDevice _purgeDevice],
-    /// which invalidates the preview layer's GPU resources.
-    ///
-    /// Strategy: rebuild the preview layer THREE times with wide spread —
-    /// macOS Tahoe plays ALL particle effects (confetti, balloons, fireworks,
-    /// hearts, lasers) during Mission Control, each of which can trigger
-    /// additional GPU purge events. The second [_purgeDevice] comes AFTER
-    /// all animations finish, which can be 3-5 seconds later.
-    ///
-    /// 1. After 300ms  — fast recovery from initial purge
-    /// 2. After 2000ms — catch mid-animation purges
-    /// 3. After 4000ms — catch final purge after all animations complete
-    private func observeSpaceChanges() {
-        // Space changed (covers Mission Control exit, Space switch, fullscreen app switch)
+    /// Single observer for space changes and visibility.
+    /// Recovery is simple: wait for the animation storm to finish, then rebuild once.
+    private func observeSpaceAndVisibility() {
+        // Space change — Mission Control, Stage Manager, desktop swipe
         spaceObserver = NotificationCenter.default.addObserver(
             forName: NSWorkspace.activeSpaceDidChangeNotification,
             object: NSWorkspace.shared,
@@ -327,47 +267,22 @@ final class ProjectionWindowController {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.isProjectionActive else { return }
-                print("[Window] Space change detected, scheduling preview rebuilds")
+                print("[Window] Space change detected")
 
-                // First rebuild — fast recovery after initial GPU purge
-                try? await Task.sleep(for: .milliseconds(300))
+                // Bring window back to front immediately
+                self.window?.orderFrontRegardless()
+
+                // Wait for Mission Control animations to fully finish.
+                // macOS Tahoe plays particle effects over ~3-5 seconds.
+                // We wait 6 seconds to be safe, then rebuild ONCE.
+                try? await Task.sleep(for: .seconds(6))
                 guard self.isProjectionActive else { return }
-                self.rebuildPreviewLayer()
-
-                // Second rebuild — catch mid-animation GPU purges
-                try? await Task.sleep(for: .milliseconds(1700))
-                guard self.isProjectionActive else { return }
-                self.rebuildPreviewLayer()
-
-                // Third rebuild — final safety net after ALL particle effects
-                // (confetti, balloons, fireworks, hearts, lasers) finish and
-                // the second [_MTLDevice _purgeDevice] fires
-                try? await Task.sleep(for: .milliseconds(2000))
-                guard self.isProjectionActive else { return }
-                self.rebuildPreviewLayer()
-            }
-        }
-
-        // App re-activation (covers returning from other apps that may have taken GPU)
-        appActivateObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didBecomeActiveNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            // Fires on .main queue — use assumeIsolated to avoid Task allocation
-            MainActor.assumeIsolated {
-                guard let self, self.isProjectionActive else { return }
-                // Ensure window is on top and rebuild preview after app activation
                 self.window?.orderFrontRegardless()
                 self.rebuildPreviewLayer()
             }
         }
 
-        // Occlusion state change — fires when Mission Control overlays/exits,
-        // fullscreen transitions, or other system overlays occlude/reveal the app.
-        // GPU purges from particle effects (confetti, balloons, fireworks, hearts,
-        // lasers) can happen WITHOUT a space change, so this catches cases that
-        // activeSpaceDidChangeNotification misses.
+        // Occlusion — app becomes visible again
         occlusionObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeOcclusionStateNotification,
             object: nil,
@@ -377,15 +292,11 @@ final class ProjectionWindowController {
                 guard let self, self.isProjectionActive else { return }
                 let isVisible = NSApp.occlusionState.contains(.visible)
                 if isVisible {
-                    // App just became visible again — GPU resources may have been purged
-                    print("[Window] App became visible, scheduling preview rebuilds")
+                    print("[Window] App became visible")
                     self.window?.orderFrontRegardless()
 
-                    // Immediate rebuild
-                    self.rebuildPreviewLayer()
-
-                    // Delayed rebuild — catch late GPU purges from finishing animations
-                    try? await Task.sleep(for: .milliseconds(1000))
+                    // Wait for any lingering animations, then rebuild
+                    try? await Task.sleep(for: .seconds(3))
                     guard self.isProjectionActive else { return }
                     self.rebuildPreviewLayer()
                 }
@@ -402,7 +313,6 @@ final class ProjectionWindowController {
             matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
         ) { [weak self] _ in
             guard let self else { return }
-            // Coalesce rapid mouse events — only dispatch once per main run loop cycle
             guard !self.pendingMouseConstrain else { return }
             self.pendingMouseConstrain = true
             DispatchQueue.main.async { [weak self] in
@@ -513,10 +423,6 @@ final class ProjectionWindowController {
             NotificationCenter.default.removeObserver(observer)
             spaceObserver = nil
         }
-        if let observer = appActivateObserver {
-            NotificationCenter.default.removeObserver(observer)
-            appActivateObserver = nil
-        }
         if let observer = occlusionObserver {
             NotificationCenter.default.removeObserver(observer)
             occlusionObserver = nil
@@ -531,21 +437,12 @@ final class ProjectionWindowController {
             object: nil,
             queue: .main
         ) { [weak self, weak cameraManager] _ in
-            // Fires on .main queue — check synchronously first
             MainActor.assumeIsolated {
                 guard let self else { return }
                 if self.takenOverDisplayID != 0 {
                     let stillConnected = NSScreen.screens.contains(where: { $0.displayID == self.takenOverDisplayID })
                     if !stillConnected {
                         self.stopProjection(cameraManager: cameraManager)
-                    } else {
-                        // Display config changed but still connected — rebuild preview
-                        // This handles resolution changes, display wake, etc.
-                        // Only use Task for the delayed rebuild
-                        Task { @MainActor [weak self] in
-                            try? await Task.sleep(for: .milliseconds(300))
-                            self?.rebuildPreviewLayer()
-                        }
                     }
                 }
             }
@@ -564,16 +461,25 @@ private class PreviewBackedView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         self.wantsLayer = true
+        self.layerContentsRedrawPolicy = .onSetNeedsDisplay
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         self.wantsLayer = true
+        self.layerContentsRedrawPolicy = .onSetNeedsDisplay
     }
 
     override func makeBackingLayer() -> CALayer {
         previewLayer.isOpaque = true
         previewLayer.backgroundColor = NSColor.black.cgColor
+        previewLayer.drawsAsynchronously = true
+        previewLayer.actions = [
+            "bounds": NSNull(),
+            "position": NSNull(),
+            "contents": NSNull(),
+            "sublayers": NSNull()
+        ]
         return previewLayer
     }
 

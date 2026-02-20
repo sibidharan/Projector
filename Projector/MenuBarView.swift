@@ -323,7 +323,7 @@ struct MenuBarView: View {
         }
     }
 
-    /// Picker row with leading icon
+    /// Picker row with leading icon — content stretches to fill width
     private func pickerRow<Content: View>(
         icon: String,
         iconColor: Color = .secondary,
@@ -335,6 +335,7 @@ struct MenuBarView: View {
                 .frame(width: 16)
                 .foregroundStyle(iconColor == .primary ? .secondary : iconColor)
             content()
+                .frame(maxWidth: .infinity)
         }
     }
 

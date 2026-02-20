@@ -11,12 +11,13 @@
 //
 //  Both the menu bar preview and the HDMI projection window use
 //  AVCaptureVideoPreviewLayer — Apple's own optimized rendering path.
+//  No AVCaptureVideoDataOutput is attached — this keeps the capture pipeline
+//  clean with a single consumer (the preview layer), avoiding extra frame
+//  copies that can cause stuttering with virtual cameras like Boom Camera.
 //
-//  Frame Heartbeat:
-//  A lightweight AVCaptureVideoDataOutput acts as a heartbeat monitor.
-//  It doesn't process frames — it just records when the last frame arrived.
-//  A watchdog timer checks this timestamp and restarts the session if
-//  frames stop arriving for > 2 seconds (capture card stall).
+//  Watchdog:
+//  A timer checks the capture session state every 2 seconds.
+//  If the session stops unexpectedly, it restarts automatically.
 //
 
 import AVFoundation
@@ -25,7 +26,7 @@ import CoreMedia
 import QuartzCore
 
 @MainActor
-final class CameraManager: NSObject, ObservableObject {
+final class CameraManager: ObservableObject {
 
     @Published var availableCameras: [AVCaptureDevice] = []
     @Published var selectedCamera: AVCaptureDevice? {
@@ -49,28 +50,14 @@ final class CameraManager: NSObject, ObservableObject {
     weak var projectionController: ProjectionWindowController?
 
     private var currentInput: AVCaptureDeviceInput?
-    private var heartbeatOutput: AVCaptureVideoDataOutput?
     private var deviceObservers: [NSObjectProtocol] = []
     private var sessionObservers: [NSObjectProtocol] = []
-
-    // Frame heartbeat — timestamp of last received frame
-    // Written by heartbeatQueue (background), read by watchdog and health check
-    nonisolated(unsafe) var _lastFrameTime: CFTimeInterval = 0
-
-    /// Public accessor for the last frame timestamp.
-    /// Used by ProjectionWindowController's health check to detect
-    /// when frames are arriving but the preview layer is stale.
-    var lastFrameTime: CFTimeInterval { _lastFrameTime }
-    // Use .utility QoS — heartbeat only timestamps frames, doesn't need high priority.
-    // Using .userInitiated wastes CPU competing with the main thread.
-    private let heartbeatQueue = DispatchQueue(label: "projector.heartbeat", qos: .utility)
 
     // Watchdog timer — detects frozen capture card
     private var watchdogTimer: Timer?
     private var isRestarting = false
 
-    override init() {
-        super.init()
+    init() {
         refreshCameraList()
         observeDeviceChanges()
         observeSessionEvents()
@@ -111,7 +98,6 @@ final class CameraManager: NSObject, ObservableObject {
             captureSession.startRunning()
             await MainActor.run { [weak self] in
                 self?.isRunning = true
-                self?._lastFrameTime = CACurrentMediaTime()
                 self?.startWatchdog()
             }
         }
@@ -150,7 +136,6 @@ final class CameraManager: NSObject, ObservableObject {
                 guard let self else { return }
                 self.isRestarting = false
                 self.isRunning = captureSession.isRunning
-                self._lastFrameTime = CACurrentMediaTime()
                 if captureSession.isRunning {
                     print("[Camera] Session restarted successfully")
                     // Rebuild the preview layer so it gets a fresh GPU pipeline
@@ -166,9 +151,6 @@ final class CameraManager: NSObject, ObservableObject {
         guard let device = selectedCamera else { return }
 
         // Disable macOS system video effects BEFORE session configuration.
-        // These effects (Center Stage, Portrait Blur, Studio Light) intercept
-        // every frame in the CMIO pipeline and can cause massive frame drops
-        // when CVPixelBufferPool allocation fails (error -6689).
         disableSystemVideoEffects(for: device)
 
         captureSession.beginConfiguration()
@@ -179,18 +161,8 @@ final class CameraManager: NSObject, ObservableObject {
             currentInput = nil
         }
 
-        // Remove existing heartbeat output
-        if let existing = heartbeatOutput {
-            captureSession.removeOutput(existing)
-            heartbeatOutput = nil
-        }
-
-        // Set session preset to high for best quality pipeline hint
-        if captureSession.canSetSessionPreset(.high) {
-            captureSession.sessionPreset = .high
-        }
-
-        // Add new input
+        // Add new input — NO output attached.
+        // The ONLY consumer is AVCaptureVideoPreviewLayer.
         do {
             let input = try AVCaptureDeviceInput(device: device)
             if captureSession.canAddInput(input) {
@@ -203,20 +175,7 @@ final class CameraManager: NSObject, ObservableObject {
             return
         }
 
-        // Add heartbeat output — lightweight frame arrival monitor.
-        // alwaysDiscardsLateVideoFrames = true ensures this never buffers.
-        // The delegate just timestamps — no processing, no copies.
-        let output = AVCaptureVideoDataOutput()
-        output.alwaysDiscardsLateVideoFrames = true
-        output.setSampleBufferDelegate(self, queue: heartbeatQueue)
-
-        if captureSession.canAddOutput(output) {
-            captureSession.addOutput(output)
-            heartbeatOutput = output
-        }
-
-        // Configure best format — prefers formats without Portrait Effect
-        // to bypass the PortraitBlur pipeline entirely
+        // Configure best format
         configureBestFormat(for: device)
 
         captureSession.commitConfiguration()
@@ -227,18 +186,13 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     /// Disable macOS system video effects that intercept the CMIO pipeline.
-    /// Center Stage, Portrait Blur, and Studio Light all process every frame
-    /// through CVPixelBufferPool, which can fail and drop frames.
     private func disableSystemVideoEffects(for device: AVCaptureDevice) {
-        // Center Stage — we can take app-level control and disable it
         if AVCaptureDevice.isCenterStageEnabled {
             AVCaptureDevice.centerStageControlMode = .app
             AVCaptureDevice.isCenterStageEnabled = false
             print("[Camera] Disabled Center Stage")
         }
 
-        // Portrait Effect — can only be read, not set programmatically.
-        // We handle this by preferring formats where isPortraitEffectSupported = false.
         if device.isPortraitEffectActive {
             print("[Camera] Warning: Portrait Effect is active — prefer non-portrait format")
             print("[Camera] To avoid frame drops, disable Portrait Effect in System Settings > Camera")
@@ -263,7 +217,6 @@ final class CameraManager: NSObject, ObservableObject {
             let maxFPS = range.maxFrameRate
             let fourCC = fourCharCodeToString(subType)
 
-            // Check if this format triggers the PortraitBlur pipeline
             let hasPortrait = format.isPortraitEffectSupported
             let hasCenterStage = format.isCenterStageSupported
 
@@ -278,10 +231,9 @@ final class CameraManager: NSObject, ObservableObject {
             ))
         }
 
-        // Sort: prefer formats WITHOUT system video effects (they cause frame drops),
+        // Sort: prefer formats WITHOUT system video effects,
         // then highest resolution, then highest FPS, then raw formats
         modes.sort { a, b in
-            // Prefer no-effect formats — they bypass the PortraitBlur pipeline
             let aClean = !a.hasPortraitEffect && !a.hasCenterStage
             let bClean = !b.hasPortraitEffect && !b.hasCenterStage
             if aClean != bClean { return aClean }
@@ -347,21 +299,18 @@ final class CameraManager: NSObject, ObservableObject {
     // MARK: - Session Event Observation
 
     private func observeSessionEvents() {
-        // Session was interrupted (e.g., capture card hiccup, system sleep)
         let interruptionObs = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.wasInterruptedNotification,
             object: captureSession,
             queue: .main
         ) { [weak self] _ in
             print("[Camera] Session interrupted")
-            // Need Task only for the delayed restart
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(1))
                 self?.restartSession()
             }
         }
 
-        // Session interruption ended
         let interruptionEndedObs = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.interruptionEndedNotification,
             object: captureSession,
@@ -370,7 +319,6 @@ final class CameraManager: NSObject, ObservableObject {
             print("[Camera] Session interruption ended")
         }
 
-        // Session runtime error
         let errorObs = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.runtimeErrorNotification,
             object: captureSession,
@@ -378,7 +326,6 @@ final class CameraManager: NSObject, ObservableObject {
         ) { [weak self] notification in
             let error = notification.userInfo?[AVCaptureSessionErrorKey] as? AVError
             print("[Camera] Session runtime error: \(error?.localizedDescription ?? "unknown")")
-            // Need Task only for the delayed restart
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(1))
                 self?.restartSession()
@@ -390,29 +337,14 @@ final class CameraManager: NSObject, ObservableObject {
 
     // MARK: - Watchdog Timer
 
-    /// Checks every 2 seconds if frames are still arriving.
-    /// If no frame has arrived in > 2 seconds, the capture card has stalled
-    /// and we need to restart the session.
     private func startWatchdog() {
         stopWatchdog()
         watchdogTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            // Timer fires on main RunLoop — already on main thread.
-            // Use assumeIsolated to avoid Task allocation overhead.
             MainActor.assumeIsolated {
                 guard let self, self.isRunning, !self.isRestarting else { return }
 
-                // Check if session stopped
                 if !self.captureSession.isRunning {
                     print("[Camera] Watchdog: session stopped unexpectedly, restarting")
-                    self.restartSession()
-                    return
-                }
-
-                // Check if frames stopped arriving (capture card stall)
-                let now = CACurrentMediaTime()
-                let elapsed = now - self._lastFrameTime
-                if elapsed > 2.0 && self._lastFrameTime > 0 {
-                    print("[Camera] Watchdog: no frames for \(String(format: "%.1f", elapsed))s, restarting session")
                     self.restartSession()
                 }
             }
@@ -454,33 +386,6 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         deviceObservers = [connectObserver, disconnectObserver]
-    }
-}
-
-// MARK: - AVCaptureVideoDataOutputSampleBufferDelegate (Heartbeat)
-
-extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
-
-    /// Called on heartbeatQueue for every camera frame.
-    /// This is ONLY a heartbeat — just records the timestamp.
-    /// The actual rendering is done by AVCaptureVideoPreviewLayer.
-    nonisolated func captureOutput(
-        _ output: AVCaptureOutput,
-        didOutput sampleBuffer: CMSampleBuffer,
-        from connection: AVCaptureConnection
-    ) {
-        _lastFrameTime = CACurrentMediaTime()
-    }
-
-    /// Called when a frame is dropped. Capture cards can drop frames
-    /// during signal renegotiation or bandwidth hiccups.
-    nonisolated func captureOutput(
-        _ output: AVCaptureOutput,
-        didDrop sampleBuffer: CMSampleBuffer,
-        from connection: AVCaptureConnection
-    ) {
-        // Still counts as "alive" — frames are being delivered, just dropped
-        _lastFrameTime = CACurrentMediaTime()
     }
 }
 
