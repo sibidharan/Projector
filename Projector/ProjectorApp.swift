@@ -23,8 +23,6 @@ struct ProjectorApp: App {
                 projectionController: projectionController
             )
             .onAppear {
-                // Wire up the projection controller reference so the watchdog
-                // can trigger preview layer reconnection on session restart
                 cameraManager.projectionController = projectionController
             }
         } label: {

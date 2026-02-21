@@ -50,7 +50,7 @@ final class CameraManager: ObservableObject {
 
     let captureSession = AVCaptureSession()
 
-    // Projection controller — for triggering preview layer reconnection on recovery
+    // Projection controller — for triggering preview layer rebuild on session restart
     weak var projectionController: ProjectionWindowController?
 
     private var currentInput: AVCaptureDeviceInput?
@@ -121,8 +121,7 @@ final class CameraManager: ObservableObject {
     }
 
     /// Restart the capture session to recover from stalls.
-    /// After restart, also reconnects the projection preview layer
-    /// to force AVFoundation to rebuild its GPU pipeline.
+    /// After restart, also rebuilds the projection preview layer.
     func restartSession() {
         guard !isRestarting else { return }
         isRestarting = true
@@ -142,8 +141,7 @@ final class CameraManager: ObservableObject {
                 self.isRunning = captureSession.isRunning
                 if captureSession.isRunning {
                     print("[Camera] Session restarted successfully")
-                    // Rebuild the preview layer so it gets a fresh GPU pipeline
-                    self.projectionController?.rebuildPreviewLayer()
+                    self.projectionController?.fullRebuildPreviewLayer()
                 }
             }
         }
@@ -238,15 +236,11 @@ final class CameraManager: ObservableObject {
         // Sort: prefer formats WITHOUT system video effects,
         // then standard aspect ratios (16:9, 4:3) over square/unusual,
         // then highest resolution, then highest FPS, then raw formats.
-        //
-        // Square formats like 1552x1552 are Center Stage crop formats
-        // from the built-in camera — not useful for HDMI projection.
         modes.sort { a, b in
             let aClean = !a.hasPortraitEffect && !a.hasCenterStage
             let bClean = !b.hasPortraitEffect && !b.hasCenterStage
             if aClean != bClean { return aClean }
 
-            // Prefer standard aspect ratios (16:9, 4:3, 16:10) over square/unusual
             let aStandard = isStandardAspectRatio(width: a.width, height: a.height)
             let bStandard = isStandardAspectRatio(width: b.width, height: b.height)
             if aStandard != bStandard { return aStandard }
@@ -261,11 +255,7 @@ final class CameraManager: ObservableObject {
             return false
         }
 
-        // Deduplicate: keep only the first (best) mode for each unique
-        // resolution + fps + codec combo. Multiple AVCaptureDevice.Format
-        // objects can share the same visible specs but differ internally
-        // (color space, portrait effect, etc). Showing duplicates in the
-        // Picker causes the selected item to not match what's playing.
+        // Deduplicate
         var seen = Set<String>()
         modes = modes.filter { mode in
             let key = "\(mode.width)x\(mode.height)@\(Int(mode.maxFPS))_\(mode.codec)"
@@ -274,9 +264,7 @@ final class CameraManager: ObservableObject {
 
         availableCameraModes = modes
 
-        // Pick the best default: prefer the format that matches the output
-        // display resolution (e.g., 1920x1080 for a 1080p HDMI display).
-        // Falls back to highest resolution with >= 30fps.
+        // Pick the best default: prefer matching output display resolution
         let targetW = targetDisplayWidth
         let targetH = targetDisplayHeight
         let best = modes.first(where: { $0.width == targetW && $0.height == targetH && $0.maxFPS >= 30 })
@@ -298,12 +286,9 @@ final class CameraManager: ObservableObject {
         applyCameraMode(mode, to: device)
     }
 
-    /// Check if a resolution has a standard video aspect ratio (16:9, 4:3, 16:10).
-    /// Square formats (1:1) like 1552x1552 are Center Stage crops — not useful for HDMI.
     private func isStandardAspectRatio(width: Int, height: Int) -> Bool {
         guard height > 0 else { return false }
         let ratio = Double(width) / Double(height)
-        // 16:9 = 1.778, 4:3 = 1.333, 16:10 = 1.6, 21:9 = 2.333
         return ratio > 1.2 && ratio < 2.5
     }
 
@@ -440,10 +425,6 @@ struct CameraMode: Identifiable, Hashable {
     let hasPortraitEffect: Bool
     let hasCenterStage: Bool
 
-    /// Unique ID using the format object's identity.
-    /// Multiple formats can share the same resolution/fps/codec but differ
-    /// in color space, portrait effect support, etc. Using ObjectIdentifier
-    /// ensures SwiftUI's Picker matches the exact format that was applied.
     var id: ObjectIdentifier { ObjectIdentifier(format) }
 
     var label: String {

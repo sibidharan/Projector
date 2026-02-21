@@ -6,35 +6,42 @@
 //
 //  Manages a borderless fullscreen window on the external display.
 //
-//  Uses AVCaptureVideoPreviewLayer for native-quality rendering.
-//  This is Apple's own optimized path — zero-copy GPU texture sharing,
-//  VSync-aligned presentation, hardware scaling.
+//  Rendering pipeline: IOSurface-backed CALayer.contents
 //
-//  Mission Control / Stage Manager recovery:
-//  ─────────────────────────────────────────
-//  macOS Tahoe's Mission Control can trigger [_MTLDevice _purgeDevice] which
-//  corrupts the preview layer's GPU textures. The layer goes black but its
-//  connection still reports "active" — so we can't detect it via connection state.
+//  Uses AVCaptureVideoDataOutput to receive camera frames as CVPixelBuffer
+//  (IOSurface-backed), then sets them directly on a CALayer.contents property.
 //
-//  Recovery strategy: SIMPLE and SAFE.
-//  - On space change or becoming visible: wait for animations to finish, then
-//    do a SINGLE rebuild by detaching and reattaching the session on the same layer.
-//  - No new views, no contentView swaps, no complex state machines.
-//  - Just: previewLayer.session = nil → delay → previewLayer.session = session
-//  - This forces AVFoundation to recreate its internal GPU pipeline cleanly.
-//  - A single Task handles recovery — if another space change fires while
-//    we're waiting, the guard prevents re-entry.
+//  Why NOT AVCaptureVideoPreviewLayer:
+//  macOS Tahoe fires [_MTLDevice _purgeDevice] during space-transition particle
+//  effects (confetti, balloons, fireworks, hearts, lasers). This silently
+//  destroys Metal textures, including AVCaptureVideoPreviewLayer's internal
+//  textures. The layer's connection still reports "active" but the display is
+//  frozen. No notification fires for external displays. The freeze is permanent.
+//
+//  Why IOSurface + CALayer.contents works:
+//  IOSurface data is managed by the kernel (IOSurfaceRoot kext), NOT by Metal.
+//  When _purgeDevice destroys Metal textures, the IOSurface backing store
+//  survives in system memory. Setting CALayer.contents to an IOSurface-backed
+//  CVPixelBuffer lets WindowServer composite the frame directly without going
+//  through the app's Metal pipeline.
+//
+//  Freeze detection:
+//  A heartbeat monitor checks that frames are flowing. If frames stop for >1s,
+//  we show a CGImage snapshot (CPU-resident, immune to GPU purge) as fallback
+//  and bounce the session to restart frame delivery.
 //
 
 import AppKit
 import AVFoundation
+import CoreVideo
+import os
 import QuartzCore
 
 @MainActor
 final class ProjectionWindowController {
 
     private var window: NSWindow?
-    private var contentView: PreviewBackedView?
+    private var displayView: IOSurfaceDisplayView?
     private var screenObserver: NSObjectProtocol?
     private var spaceObserver: NSObjectProtocol?
     private var occlusionObserver: NSObjectProtocol?
@@ -42,7 +49,7 @@ final class ProjectionWindowController {
     private var mouseEventMonitor: Any?
     private var pendingMouseConstrain = false
 
-    // Health check timer — catches session disconnects
+    // Health check timer — freeze detection
     private var healthTimer: Timer?
 
     // Keep reference for reconfiguration
@@ -54,12 +61,14 @@ final class ProjectionWindowController {
     private var takenOverDisplayID: CGDirectDisplayID = 0
     private var isProjectionActive = false
 
-    // Recovery state — prevents overlapping recoveries
-    private var isRecovering = false
-
-    // Cancellable recovery task — new space changes cancel pending recovery
-    // so we always recover from the LATEST event, not an old stale one
+    // Cancellable recovery task
     private var recoveryTask: Task<Void, Never>?
+
+    // Frame delegate — receives frames from AVCaptureVideoDataOutput
+    private let frameReceiver = FrameReceiver()
+
+    // Video data output — attached to the capture session for frame delivery
+    private var videoDataOutput: AVCaptureVideoDataOutput?
 
     // MARK: - Projection Control
 
@@ -76,6 +85,7 @@ final class ProjectionWindowController {
         }
 
         createProjectionWindow(on: updatedScreen, cameraManager: cameraManager)
+        attachVideoOutput(to: cameraManager)
 
         self.isProjectionActive = true
         observeScreenDisconnect(cameraManager: cameraManager)
@@ -83,22 +93,21 @@ final class ProjectionWindowController {
         startMouseConfinement()
         startHealthCheck()
 
-        print("[Window] Projection started on display \(displayID) using AVCaptureVideoPreviewLayer")
+        print("[Window] Projection started on display \(displayID) using IOSurface + CALayer.contents")
     }
 
     func stopProjection(cameraManager: CameraManager? = nil) {
         isProjectionActive = false
-        isRecovering = false
         recoveryTask?.cancel()
         recoveryTask = nil
         stopHealthCheck()
         stopMouseConfinement()
         removeObservers()
+        detachVideoOutput()
 
         activeCameraManager = nil
 
-        contentView?.previewLayer.session = nil
-        contentView = nil
+        displayView = nil
         window?.close()
         window = nil
 
@@ -109,8 +118,7 @@ final class ProjectionWindowController {
 
     private func createProjectionWindow(on screen: NSScreen, cameraManager: CameraManager) {
         // Clean up old
-        contentView?.previewLayer.session = nil
-        contentView = nil
+        displayView = nil
         window?.close()
         window = nil
 
@@ -144,98 +152,84 @@ final class ProjectionWindowController {
 
         // CRITICAL: Exclude this window from screen capture.
         // Without this, virtual cameras (Boom Camera, OBS Virtual Camera) that
-        // capture the screen will create a feedback loop:
-        //   Screen capture → virtual camera → our preview layer → our window → screen capture
-        // During Mission Control / Stage Manager, this feedback loop combined with
-        // GPU pressure causes the CMIO virtual camera pipeline to stall, hanging
-        // the projection. Hardware cameras are unaffected because their feed is
-        // independent of screen content.
-        //
-        // .none = this window is invisible to screen capture APIs (CGWindowListCopyWindowInfo,
-        // SCScreenshotManager, ScreenCaptureKit, etc). The HDMI output still shows it
-        // because the display hardware reads directly from the framebuffer.
+        // capture the screen will create a feedback loop.
         projectionWindow.sharingType = .none
 
         self.window = projectionWindow
 
-        // Build and attach the preview layer
-        let view = PreviewBackedView(frame: NSRect(origin: .zero, size: frame.size))
+        // Build the display view — a plain CALayer that receives CVPixelBuffer frames
+        let view = IOSurfaceDisplayView(frame: NSRect(origin: .zero, size: frame.size))
         view.autoresizingMask = [.width, .height]
 
-        let preview = view.previewLayer
-        preview.session = cameraManager.captureSession
-        preview.videoGravity = .resizeAspect
-
-        if let connection = preview.connection {
-            if connection.isVideoMirroringSupported {
-                connection.automaticallyAdjustsVideoMirroring = false
-                connection.isVideoMirrored = false
-            }
-        }
-
         projectionWindow.contentView = view
-        self.contentView = view
+        self.displayView = view
 
         projectionWindow.setFrame(frame, display: true)
         projectionWindow.orderFrontRegardless()
 
-        print("[Window] PreviewLayer attached, connection active: \(preview.connection?.isActive ?? false)")
+        print("[Window] IOSurface display view attached")
     }
 
-    // MARK: - Preview Layer Recovery
+    // MARK: - Video Data Output
 
-    /// Rebuild the preview layer by detaching and reattaching the session.
-    /// This forces AVFoundation to recreate its internal GPU pipeline.
-    ///
-    /// This is the ONLY recovery mechanism. It's simple and safe:
-    /// - No new views or contentView swaps (those cause black frame flashes)
-    /// - Just nil the session, wait a beat, reassign it
-    /// - AVFoundation handles the rest internally
-    func rebuildPreviewLayer() {
-        guard isProjectionActive, !isRecovering else { return }
-        guard let preview = contentView?.previewLayer,
-              let camera = activeCameraManager else { return }
+    /// Attach AVCaptureVideoDataOutput to the capture session.
+    /// Requests IOSurface-backed buffers so frames survive GPU purge.
+    private func attachVideoOutput(to cameraManager: CameraManager) {
+        detachVideoOutput()
 
-        isRecovering = true
-        let session = camera.captureSession
+        let output = AVCaptureVideoDataOutput()
+        output.alwaysDiscardsLateVideoFrames = true
+        // Request IOSurface-backed BGRA buffers — kernel-managed, survives _purgeDevice
+        output.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
 
-        print("[Window] Recovering preview layer (session detach/reattach)")
+        // Wire the frame receiver to push frames to our display view
+        frameReceiver.displayView = displayView
+        output.setSampleBufferDelegate(frameReceiver, queue: frameReceiver.queue)
 
-        // Detach session from preview layer
-        preview.session = nil
-
-        // Brief delay to let AVFoundation release GPU resources
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(100))
-            guard let self, self.isProjectionActive else {
-                self?.isRecovering = false
-                return
-            }
-
-            // Reattach session — AVFoundation creates fresh GPU pipeline
-            preview.session = session
-
-            // Reconfigure connection
-            if let connection = preview.connection {
-                if connection.isVideoMirroringSupported {
-                    connection.automaticallyAdjustsVideoMirroring = false
-                    connection.isVideoMirrored = false
-                }
-            }
-
-            self.window?.orderFrontRegardless()
-            self.isRecovering = false
-            print("[Window] Preview layer recovered, connection active: \(preview.connection?.isActive ?? false)")
+        let session = cameraManager.captureSession
+        session.beginConfiguration()
+        if session.canAddOutput(output) {
+            session.addOutput(output)
+            self.videoDataOutput = output
+            print("[Window] VideoDataOutput attached for IOSurface frame delivery")
+        } else {
+            print("[Window] WARNING: Could not add VideoDataOutput to session")
         }
+        session.commitConfiguration()
     }
 
-    // MARK: - Health Check
+    /// Remove the video data output from the capture session.
+    private func detachVideoOutput() {
+        guard let output = videoDataOutput else { return }
+        activeCameraManager?.captureSession.beginConfiguration()
+        activeCameraManager?.captureSession.removeOutput(output)
+        activeCameraManager?.captureSession.commitConfiguration()
+        videoDataOutput = nil
+        frameReceiver.displayView = nil
+        print("[Window] VideoDataOutput detached")
+    }
 
-    /// Periodically verify the preview layer's connection is alive.
-    /// If session or connection is lost, trigger recovery.
+    /// Called externally (e.g., after session restart) to force recovery.
+    func fullRebuildPreviewLayer() {
+        guard isProjectionActive else { return }
+        print("[Window] Full rebuild requested — bouncing session")
+        bounceSession()
+    }
+
+    // MARK: - Health Check (Freeze Detection)
+    //
+    // Every 2 seconds, check if frames are flowing via the heartbeat.
+    // If frames stopped for >1.5 seconds, the pipeline is likely frozen
+    // by _purgeDevice. Show the CGImage snapshot fallback and bounce the session.
+    //
+    // This is the ONLY reliable detection method — connection.isActive lies,
+    // no notifications fire for external displays.
+
     private func startHealthCheck() {
         stopHealthCheck()
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.checkHealth()
             }
@@ -248,49 +242,51 @@ final class ProjectionWindowController {
     }
 
     private func checkHealth() {
-        guard isProjectionActive, !isRecovering else { return }
-        guard let preview = contentView?.previewLayer else {
-            print("[Window] Health: no preview layer")
-            return
-        }
+        guard isProjectionActive else { return }
 
-        // Check session
-        guard preview.session != nil else {
-            print("[Window] Health: session nil, recovering")
-            rebuildPreviewLayer()
-            return
-        }
+        let timeSinceLastFrame = frameReceiver.timeSinceLastFrame()
 
-        // Check connection
-        if let connection = preview.connection {
-            if !connection.isActive || !connection.isEnabled {
-                print("[Window] Health: connection inactive/disabled, recovering")
-                rebuildPreviewLayer()
-                return
+        if timeSinceLastFrame > 1.5 && frameReceiver.hasReceivedAnyFrame {
+            print("[Window] Health: no frame for \(String(format: "%.1f", timeSinceLastFrame))s — frozen, bouncing session")
+            // Show last good frame as CGImage (CPU-resident, immune to GPU purge)
+            if let snapshot = frameReceiver.lastGoodSnapshot {
+                displayView?.showSnapshot(snapshot)
             }
-        } else {
-            print("[Window] Health: no connection, recovering")
-            rebuildPreviewLayer()
-            return
+            bounceSession()
+        }
+
+        // Always keep window on top
+        window?.orderFrontRegardless()
+    }
+
+    /// Bounce the capture session — stop and restart.
+    /// This forces AVFoundation to rebuild its internal GPU pipeline.
+    /// The display view keeps showing the last frame (or snapshot) during the bounce.
+    private func bounceSession() {
+        guard let camera = activeCameraManager else { return }
+        let session = camera.captureSession
+
+        Task.detached { [weak self] in
+            if session.isRunning {
+                session.stopRunning()
+            }
+            // Brief pause to let GPU recover from purge
+            try? await Task.sleep(for: .milliseconds(300))
+            session.startRunning()
+
+            await MainActor.run { [weak self] in
+                guard let self, self.isProjectionActive else { return }
+                print("[Window] Session bounced, isRunning: \(session.isRunning)")
+                self.window?.orderFrontRegardless()
+            }
         }
     }
 
     // MARK: - Space / Mission Control / Stage Manager Observation
 
-    /// Observe space changes and visibility for recovery.
-    ///
-    /// Recovery strategy:
-    /// Each space change CANCELS any pending recovery and starts fresh.
-    /// This handles fast swiping — we always recover from the LATEST swipe,
-    /// not a stale one from 6 seconds ago.
-    ///
-    /// Timeline:
-    /// 1. Immediately: bring window to front
-    /// 2. After 1s: quick rebuild (handles simple swipes with no particles)
-    /// 3. After 6s: final rebuild (handles Mission Control particle storms)
-    ///
-    /// If another swipe happens during the wait, steps 2 and 3 are cancelled
-    /// and restarted from the new event.
+    /// Observe space changes, visibility, and app activation.
+    /// These events correlate with _purgeDevice firing, so we
+    /// proactively check health and bounce if needed.
     private func observeSpaceAndVisibility() {
         // Space change — Mission Control, Stage Manager, desktop swipe
         spaceObserver = NotificationCenter.default.addObserver(
@@ -302,7 +298,7 @@ final class ProjectionWindowController {
                 guard let self, self.isProjectionActive else { return }
                 print("[Window] Space change detected")
                 self.window?.orderFrontRegardless()
-                self.scheduleRecovery()
+                self.scheduleRecoveryCheck()
             }
         }
 
@@ -318,15 +314,12 @@ final class ProjectionWindowController {
                 if isVisible {
                     print("[Window] App became visible")
                     self.window?.orderFrontRegardless()
-                    self.scheduleRecovery()
+                    self.scheduleRecoveryCheck()
                 }
             }
         }
 
-        // App activation — fires when returning from interactive transitions
-        // that snap back (e.g., 4-finger swipe held midway then released back).
-        // In this case NO space change notification fires, but the preview layer
-        // may have stalled from GPU starvation during the live transition.
+        // App activation
         appActivateObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification,
             object: nil,
@@ -334,45 +327,35 @@ final class ProjectionWindowController {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.isProjectionActive else { return }
+                print("[Window] App activated")
                 self.window?.orderFrontRegardless()
-                // Only schedule recovery if there isn't one already pending
-                // (space change observer may have already triggered one)
-                if self.recoveryTask == nil {
-                    print("[Window] App activated, scheduling recovery")
-                    self.scheduleRecovery()
-                }
+                self.scheduleRecoveryCheck()
             }
         }
     }
 
-    /// Cancel any pending recovery and schedule a fresh one.
-    /// This ensures we always recover from the LATEST space change event,
-    /// not a stale one. Critical for fast swiping between fullscreen apps
-    /// where multiple space changes fire in rapid succession.
-    private func scheduleRecovery() {
-        // Cancel previous recovery — it's stale now
+    /// After an event that might correlate with GPU purge,
+    /// check if frames are still flowing. If not, bounce.
+    private func scheduleRecoveryCheck() {
         recoveryTask?.cancel()
 
         recoveryTask = Task { @MainActor [weak self] in
             guard let self, self.isProjectionActive else { return }
 
-            // Quick rebuild after 1 second — handles simple space switches
-            // (4-finger swipe between desktops) where there are no particle effects,
-            // just a GPU texture invalidation.
+            // Wait a moment for the transition particle effects to fire
             try? await Task.sleep(for: .seconds(1))
-            guard !Task.isCancelled else { return }
-            guard self.isProjectionActive else { return }
-            self.window?.orderFrontRegardless()
-            self.rebuildPreviewLayer()
+            guard !Task.isCancelled, self.isProjectionActive else { return }
+            self.checkHealth()
 
-            // Final rebuild after 6 seconds — handles Mission Control with
-            // particle effects (confetti, balloons, fireworks, hearts, lasers)
-            // that fire _purgeDevice multiple times over ~3-5 seconds.
-            try? await Task.sleep(for: .seconds(5))
-            guard !Task.isCancelled else { return }
-            guard self.isProjectionActive else { return }
-            self.window?.orderFrontRegardless()
-            self.rebuildPreviewLayer()
+            // Check again after effects may have finished
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, self.isProjectionActive else { return }
+            self.checkHealth()
+
+            // Final check
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled, self.isProjectionActive else { return }
+            self.checkHealth()
         }
     }
 
@@ -526,38 +509,152 @@ final class ProjectionWindowController {
     }
 }
 
-// MARK: - NSView backed by AVCaptureVideoPreviewLayer
+// MARK: - IOSurface Display View
 
-/// An NSView whose backing layer IS an AVCaptureVideoPreviewLayer.
-/// This gives AVFoundation direct control over the layer's rendering pipeline.
-private class PreviewBackedView: NSView {
+/// An NSView that displays CVPixelBuffer frames via CALayer.contents.
+/// The layer content is set directly to the IOSurface-backed pixel buffer,
+/// bypassing Metal entirely. WindowServer composites the IOSurface directly.
+final class IOSurfaceDisplayView: NSView {
 
-    let previewLayer = AVCaptureVideoPreviewLayer()
+    private let displayLayer = CALayer()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        self.wantsLayer = true
-        self.layerContentsRedrawPolicy = .onSetNeedsDisplay
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+
+        displayLayer.contentsGravity = .resizeAspect
+        displayLayer.backgroundColor = NSColor.black.cgColor
+        displayLayer.isOpaque = true
+        // Suppress implicit animations on content changes
+        displayLayer.actions = [
+            "contents": NSNull(),
+            "bounds": NSNull(),
+            "position": NSNull()
+        ]
+        layer?.addSublayer(displayLayer)
     }
 
     required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        self.wantsLayer = true
-        self.layerContentsRedrawPolicy = .onSetNeedsDisplay
+        fatalError("init(coder:) has not been implemented")
     }
 
-    override func makeBackingLayer() -> CALayer {
-        previewLayer.isOpaque = true
-        previewLayer.backgroundColor = NSColor.black.cgColor
-        previewLayer.drawsAsynchronously = true
-        previewLayer.actions = [
-            "bounds": NSNull(),
-            "position": NSNull(),
-            "contents": NSNull(),
-            "sublayers": NSNull()
-        ]
-        return previewLayer
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        displayLayer.frame = bounds
+        CATransaction.commit()
     }
 
-    override var wantsUpdateLayer: Bool { true }
+    /// Display a CVPixelBuffer frame (IOSurface-backed).
+    /// Called from the frame receiver's output queue, dispatched to main.
+    func displayPixelBuffer(_ pixelBuffer: CVPixelBuffer) {
+        // Setting CALayer.contents to a CVPixelBuffer works on macOS.
+        // The IOSurface backing survives GPU texture purge.
+        displayLayer.contents = pixelBuffer
+    }
+
+    /// Show a CGImage snapshot (CPU-resident fallback during freeze).
+    func showSnapshot(_ image: CGImage) {
+        displayLayer.contents = image
+    }
+}
+
+// MARK: - Frame Receiver
+
+/// Receives frames from AVCaptureVideoDataOutput on a dedicated queue.
+/// Pushes them to the IOSurfaceDisplayView and maintains a heartbeat
+/// for freeze detection, plus periodic CGImage snapshots for fallback.
+final class FrameReceiver: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+
+    let queue = DispatchQueue(label: "com.projector.frameReceiver", qos: .userInteractive)
+
+    /// The display view to push frames to (weak, main-actor owned).
+    weak var displayView: IOSurfaceDisplayView?
+
+    /// Heartbeat — updated atomically on the output queue.
+    /// Read from the main thread for health checks.
+    private let _lastFrameTime = OSAllocatedUnfairLock(initialState: CFAbsoluteTime(0))
+    private let _hasReceivedAnyFrame = OSAllocatedUnfairLock(initialState: false)
+
+    /// Last good CGImage snapshot (CPU-resident, immune to GPU purge).
+    private let _lastGoodSnapshot = OSAllocatedUnfairLock<CGImage?>(initialState: nil)
+    private var snapshotCounter = 0
+
+    var hasReceivedAnyFrame: Bool {
+        _hasReceivedAnyFrame.withLock { $0 }
+    }
+
+    var lastGoodSnapshot: CGImage? {
+        _lastGoodSnapshot.withLock { $0 }
+    }
+
+    func timeSinceLastFrame() -> TimeInterval {
+        let lastTime = _lastFrameTime.withLock { $0 }
+        guard lastTime > 0 else { return 0 }
+        return CFAbsoluteTimeGetCurrent() - lastTime
+    }
+
+    // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        // Update heartbeat
+        _lastFrameTime.withLock { $0 = CFAbsoluteTimeGetCurrent() }
+        _hasReceivedAnyFrame.withLock { $0 = true }
+
+        // Capture CGImage snapshot periodically (every ~60 frames ≈ 1-2s)
+        snapshotCounter += 1
+        if snapshotCounter % 60 == 0 {
+            captureSnapshot(from: pixelBuffer)
+        }
+
+        // Push frame to display view on main thread
+        let view = displayView
+        DispatchQueue.main.async {
+            view?.displayPixelBuffer(pixelBuffer)
+        }
+    }
+
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didDrop sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        // Still update heartbeat — dropped frames mean the pipeline is alive
+        _lastFrameTime.withLock { $0 = CFAbsoluteTimeGetCurrent() }
+    }
+
+    // MARK: - Snapshot
+
+    private func captureSnapshot(from pixelBuffer: CVPixelBuffer) {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: baseAddress,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+        ) else { return }
+
+        if let image = context.makeImage() {
+            _lastGoodSnapshot.withLock { $0 = image }
+        }
+    }
 }

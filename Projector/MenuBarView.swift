@@ -370,9 +370,12 @@ struct MenuBarView: View {
 
     private var footerSection: some View {
         HStack {
-            Text("Projector")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+            Button("About") {
+                AboutWindowController.shared.show()
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .font(.caption)
             Spacer()
             Button("Quit") {
                 NSApplication.shared.terminate(nil)
