@@ -54,8 +54,8 @@ Built for video production workflows using capture cards — bringing clock-sync
 
 ## Requirements
 
-- macOS 26.0+ (Tahoe)
-- Apple Silicon Mac
+- macOS 15.0+ (Sequoia)
+- Apple Silicon Mac (recommended)
 - External display connected via HDMI/DisplayPort/USB-C
 - Camera permissions
 - Microphone permissions (for audio routing)

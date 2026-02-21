@@ -361,7 +361,7 @@ struct MenuBarView: View {
             .frame(maxWidth: .infinity)
         }
         .controlSize(.large)
-        .buttonStyle(.glassProminent)
+        .buttonStyle(.borderedProminent)
         .tint(displayManager.isProjecting ? .red : nil)
         .disabled(displayManager.selectedDisplay == nil)
     }
