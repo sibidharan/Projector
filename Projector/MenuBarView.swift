@@ -394,7 +394,7 @@ struct MenuBarView: View {
         case cameraAudio
         case microphone(String) // uniqueID
 
-        static func from(audioManager: AudioManager) -> AudioPickerOption {
+        @MainActor static func from(audioManager: AudioManager) -> AudioPickerOption {
             if audioManager.selectedMic == nil {
                 return .none
             } else if audioManager.isCameraAudioSelected {
