@@ -7,13 +7,12 @@
 //  Pipeline Architecture:
 //  ──────────────────────
 //  Menu Bar Preview:  AVCaptureSession → AVCaptureVideoPreviewLayer (zero-copy GPU path)
-//  HDMI Projection:   AVCaptureSession → AVCaptureVideoPreviewLayer (zero-copy GPU path)
+//  HDMI Projection:   AVCaptureSession → AVCaptureVideoDataOutput → IOSurface → CALayer.contents
 //
-//  Both the menu bar preview and the HDMI projection window use
-//  AVCaptureVideoPreviewLayer — Apple's own optimized rendering path.
-//  No AVCaptureVideoDataOutput is attached — this keeps the capture pipeline
-//  clean with a single consumer (the preview layer), avoiding extra frame
-//  copies that can cause stuttering with virtual cameras like Boom Camera.
+//  The menu bar preview uses AVCaptureVideoPreviewLayer (Apple's optimized path).
+//  The HDMI projection uses AVCaptureVideoDataOutput with IOSurface-backed
+//  CVPixelBuffers set directly to CALayer.contents. IOSurface data is kernel-managed
+//  and survives GPU texture purge (_purgeDevice) during macOS space transitions.
 //
 //  Watchdog:
 //  A timer checks the capture session state every 2 seconds.
@@ -163,8 +162,8 @@ final class CameraManager: ObservableObject {
             currentInput = nil
         }
 
-        // Add new input — NO output attached.
-        // The ONLY consumer is AVCaptureVideoPreviewLayer.
+        // Add new input.
+        // Outputs (VideoDataOutput for projection) are attached by ProjectionWindowController.
         do {
             let input = try AVCaptureDeviceInput(device: device)
             if captureSession.canAddInput(input) {

@@ -21,11 +21,12 @@ Built for video production workflows using capture cards — bringing clock-sync
 ## Features
 
 **Video**
-- AVCaptureVideoPreviewLayer — Apple's zero-copy GPU rendering path
+- IOSurface-backed rendering pipeline — kernel-managed frame delivery immune to GPU texture purge
 - Camera format picker — resolution, frame rate, codec
 - Automatic best-format selection (prefers formats without system video effects)
 - Auto-disables Center Stage to avoid frame drops
 - Session watchdog — auto-restarts on capture card stalls
+- Virtual camera feedback loop prevention — projection window is excluded from screen capture
 
 **Audio**
 - Aggregate Device audio routing — combines any input + HDMI output into one device
@@ -40,19 +41,21 @@ Built for video production workflows using capture cards — bringing clock-sync
 **Display**
 - External display picker
 - Display mode/resolution selector
-- Projection window is excluded from Mission Control, Expose, and window cycling — it stays fullscreen on the external display no matter what
+- Projection window excluded from Mission Control, Expose, and window cycling — stays fullscreen on the external display no matter what
 - Mirror-set handling — auto-breaks mirroring for independent output
 - Mouse confinement — keeps cursor on the primary display
 
 **Recovery**
-- Auto-recovers from macOS Mission Control GPU purge events
-- Session detach/reattach recovery after space changes
-- Health check monitoring for connection state
+- Survives macOS Tahoe `_purgeDevice` GPU purge during space-transition particle effects
+- Heartbeat-based freeze detection — detects when frames stop flowing
+- CGImage snapshot fallback — shows last good frame during recovery (CPU-resident, immune to GPU purge)
+- Session bounce recovery — stop/restart capture session to rebuild GPU pipeline
+- Event-driven recovery bursts on space changes, app activation, and visibility changes
 
 ## Requirements
 
-- macOS 15.0+ (Sequoia)
-- Apple Silicon or Intel Mac
+- macOS 26.0+ (Tahoe)
+- Apple Silicon Mac
 - External display connected via HDMI/DisplayPort/USB-C
 - Camera permissions
 - Microphone permissions (for audio routing)
@@ -70,24 +73,31 @@ Build and run from Xcode. The app appears in the menu bar.
 ## Architecture
 
 ```
-ProjectorApp.swift          → App entry point, menu bar setup
-MenuBarView.swift           → SwiftUI menu bar UI (INPUT/OUTPUT sections)
-CameraManager.swift         → AVCaptureSession, camera enumeration, format config
-DisplayManager.swift        → External display enumeration, mode management
-AudioManager.swift          → Aggregate device, HAL AudioUnit, audio routing
-ProjectionWindowController.swift → Borderless fullscreen window, preview layer
-CameraPreviewView.swift     → Menu bar camera preview (NSViewRepresentable)
+ProjectorApp.swift              → App entry point, menu bar setup
+MenuBarView.swift               → SwiftUI menu bar UI (INPUT/OUTPUT sections)
+CameraManager.swift             → AVCaptureSession, camera enumeration, format config
+DisplayManager.swift            → External display enumeration, mode management
+AudioManager.swift              → Aggregate device, HAL AudioUnit, audio routing
+ProjectionWindowController.swift → Borderless fullscreen window, IOSurface rendering
+CameraPreviewView.swift         → Menu bar camera preview (NSViewRepresentable)
+AboutWindowController.swift     → About dialog (version, credits)
 ```
 
 ## How it works
 
 **Video pipeline:**
-Camera → AVCaptureSession → AVCaptureVideoPreviewLayer → Fullscreen NSWindow on external display
+Camera → AVCaptureSession → AVCaptureVideoDataOutput → CVPixelBuffer (IOSurface-backed) → CALayer.contents → Fullscreen NSWindow on external display
+
+The video pipeline uses IOSurface-backed CVPixelBuffers instead of AVCaptureVideoPreviewLayer. IOSurface data is managed by the kernel and survives GPU texture destruction (`_purgeDevice`) that macOS fires during space-transition particle effects. A heartbeat monitor detects stalls and bounces the session to recover.
 
 **Audio pipeline:**
 Mic/Camera Audio → Aggregate Device (input as clock master) → HAL AudioUnit render callback → HDMI output
 
 The audio and video pipelines are independent. The audio uses the input device as clock master so the capture timing drives everything — HDMI output adapts via drift compensation. This gives the lowest possible input-to-output latency with perfect lip sync.
+
+## Credits
+
+Built by [Sibidharan](https://instagram.com/sibidharan)
 
 ## License
 
