@@ -38,6 +38,7 @@ final class ProjectionWindowController {
     private var screenObserver: NSObjectProtocol?
     private var spaceObserver: NSObjectProtocol?
     private var occlusionObserver: NSObjectProtocol?
+    private var appActivateObserver: NSObjectProtocol?
     private var mouseEventMonitor: Any?
     private var pendingMouseConstrain = false
 
@@ -55,6 +56,10 @@ final class ProjectionWindowController {
 
     // Recovery state — prevents overlapping recoveries
     private var isRecovering = false
+
+    // Cancellable recovery task — new space changes cancel pending recovery
+    // so we always recover from the LATEST event, not an old stale one
+    private var recoveryTask: Task<Void, Never>?
 
     // MARK: - Projection Control
 
@@ -84,6 +89,8 @@ final class ProjectionWindowController {
     func stopProjection(cameraManager: CameraManager? = nil) {
         isProjectionActive = false
         isRecovering = false
+        recoveryTask?.cancel()
+        recoveryTask = nil
         stopHealthCheck()
         stopMouseConfinement()
         removeObservers()
@@ -134,6 +141,20 @@ final class ProjectionWindowController {
         projectionWindow.canHide = false
         projectionWindow.isMovable = false
         projectionWindow.animationBehavior = .none
+
+        // CRITICAL: Exclude this window from screen capture.
+        // Without this, virtual cameras (Boom Camera, OBS Virtual Camera) that
+        // capture the screen will create a feedback loop:
+        //   Screen capture → virtual camera → our preview layer → our window → screen capture
+        // During Mission Control / Stage Manager, this feedback loop combined with
+        // GPU pressure causes the CMIO virtual camera pipeline to stall, hanging
+        // the projection. Hardware cameras are unaffected because their feed is
+        // independent of screen content.
+        //
+        // .none = this window is invisible to screen capture APIs (CGWindowListCopyWindowInfo,
+        // SCScreenshotManager, ScreenCaptureKit, etc). The HDMI output still shows it
+        // because the display hardware reads directly from the framebuffer.
+        projectionWindow.sharingType = .none
 
         self.window = projectionWindow
 
@@ -256,8 +277,20 @@ final class ProjectionWindowController {
 
     // MARK: - Space / Mission Control / Stage Manager Observation
 
-    /// Single observer for space changes and visibility.
-    /// Recovery is simple: wait for the animation storm to finish, then rebuild once.
+    /// Observe space changes and visibility for recovery.
+    ///
+    /// Recovery strategy:
+    /// Each space change CANCELS any pending recovery and starts fresh.
+    /// This handles fast swiping — we always recover from the LATEST swipe,
+    /// not a stale one from 6 seconds ago.
+    ///
+    /// Timeline:
+    /// 1. Immediately: bring window to front
+    /// 2. After 1s: quick rebuild (handles simple swipes with no particles)
+    /// 3. After 6s: final rebuild (handles Mission Control particle storms)
+    ///
+    /// If another swipe happens during the wait, steps 2 and 3 are cancelled
+    /// and restarted from the new event.
     private func observeSpaceAndVisibility() {
         // Space change — Mission Control, Stage Manager, desktop swipe
         spaceObserver = NotificationCenter.default.addObserver(
@@ -265,20 +298,11 @@ final class ProjectionWindowController {
             object: NSWorkspace.shared,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 guard let self, self.isProjectionActive else { return }
                 print("[Window] Space change detected")
-
-                // Bring window back to front immediately
                 self.window?.orderFrontRegardless()
-
-                // Wait for Mission Control animations to fully finish.
-                // macOS Tahoe plays particle effects over ~3-5 seconds.
-                // We wait 6 seconds to be safe, then rebuild ONCE.
-                try? await Task.sleep(for: .seconds(6))
-                guard self.isProjectionActive else { return }
-                self.window?.orderFrontRegardless()
-                self.rebuildPreviewLayer()
+                self.scheduleRecovery()
             }
         }
 
@@ -288,19 +312,67 @@ final class ProjectionWindowController {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 guard let self, self.isProjectionActive else { return }
                 let isVisible = NSApp.occlusionState.contains(.visible)
                 if isVisible {
                     print("[Window] App became visible")
                     self.window?.orderFrontRegardless()
-
-                    // Wait for any lingering animations, then rebuild
-                    try? await Task.sleep(for: .seconds(3))
-                    guard self.isProjectionActive else { return }
-                    self.rebuildPreviewLayer()
+                    self.scheduleRecovery()
                 }
             }
+        }
+
+        // App activation — fires when returning from interactive transitions
+        // that snap back (e.g., 4-finger swipe held midway then released back).
+        // In this case NO space change notification fires, but the preview layer
+        // may have stalled from GPU starvation during the live transition.
+        appActivateObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isProjectionActive else { return }
+                self.window?.orderFrontRegardless()
+                // Only schedule recovery if there isn't one already pending
+                // (space change observer may have already triggered one)
+                if self.recoveryTask == nil {
+                    print("[Window] App activated, scheduling recovery")
+                    self.scheduleRecovery()
+                }
+            }
+        }
+    }
+
+    /// Cancel any pending recovery and schedule a fresh one.
+    /// This ensures we always recover from the LATEST space change event,
+    /// not a stale one. Critical for fast swiping between fullscreen apps
+    /// where multiple space changes fire in rapid succession.
+    private func scheduleRecovery() {
+        // Cancel previous recovery — it's stale now
+        recoveryTask?.cancel()
+
+        recoveryTask = Task { @MainActor [weak self] in
+            guard let self, self.isProjectionActive else { return }
+
+            // Quick rebuild after 1 second — handles simple space switches
+            // (4-finger swipe between desktops) where there are no particle effects,
+            // just a GPU texture invalidation.
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            guard self.isProjectionActive else { return }
+            self.window?.orderFrontRegardless()
+            self.rebuildPreviewLayer()
+
+            // Final rebuild after 6 seconds — handles Mission Control with
+            // particle effects (confetti, balloons, fireworks, hearts, lasers)
+            // that fire _purgeDevice multiple times over ~3-5 seconds.
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled else { return }
+            guard self.isProjectionActive else { return }
+            self.window?.orderFrontRegardless()
+            self.rebuildPreviewLayer()
         }
     }
 
@@ -426,6 +498,10 @@ final class ProjectionWindowController {
         if let observer = occlusionObserver {
             NotificationCenter.default.removeObserver(observer)
             occlusionObserver = nil
+        }
+        if let observer = appActivateObserver {
+            NotificationCenter.default.removeObserver(observer)
+            appActivateObserver = nil
         }
     }
 
