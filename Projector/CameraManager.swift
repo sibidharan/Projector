@@ -44,6 +44,10 @@ final class CameraManager: ObservableObject {
     @Published var availableCameraModes: [CameraMode] = []
     @Published var currentCameraMode: CameraMode?
 
+    // Target resolution from the output display — used to pick the best default format
+    var targetDisplayWidth: Int = 1920
+    var targetDisplayHeight: Int = 1080
+
     let captureSession = AVCaptureSession()
 
     // Projection controller — for triggering preview layer reconnection on recovery
@@ -232,11 +236,20 @@ final class CameraManager: ObservableObject {
         }
 
         // Sort: prefer formats WITHOUT system video effects,
-        // then highest resolution, then highest FPS, then raw formats
+        // then standard aspect ratios (16:9, 4:3) over square/unusual,
+        // then highest resolution, then highest FPS, then raw formats.
+        //
+        // Square formats like 1552x1552 are Center Stage crop formats
+        // from the built-in camera — not useful for HDMI projection.
         modes.sort { a, b in
             let aClean = !a.hasPortraitEffect && !a.hasCenterStage
             let bClean = !b.hasPortraitEffect && !b.hasCenterStage
             if aClean != bClean { return aClean }
+
+            // Prefer standard aspect ratios (16:9, 4:3, 16:10) over square/unusual
+            let aStandard = isStandardAspectRatio(width: a.width, height: a.height)
+            let bStandard = isStandardAspectRatio(width: b.width, height: b.height)
+            if aStandard != bStandard { return aStandard }
 
             let pixelsA = a.width * a.height
             let pixelsB = b.width * b.height
@@ -248,9 +261,27 @@ final class CameraManager: ObservableObject {
             return false
         }
 
+        // Deduplicate: keep only the first (best) mode for each unique
+        // resolution + fps + codec combo. Multiple AVCaptureDevice.Format
+        // objects can share the same visible specs but differ internally
+        // (color space, portrait effect, etc). Showing duplicates in the
+        // Picker causes the selected item to not match what's playing.
+        var seen = Set<String>()
+        modes = modes.filter { mode in
+            let key = "\(mode.width)x\(mode.height)@\(Int(mode.maxFPS))_\(mode.codec)"
+            return seen.insert(key).inserted
+        }
+
         availableCameraModes = modes
 
-        let best = modes.first(where: { $0.maxFPS >= 30 })
+        // Pick the best default: prefer the format that matches the output
+        // display resolution (e.g., 1920x1080 for a 1080p HDMI display).
+        // Falls back to highest resolution with >= 30fps.
+        let targetW = targetDisplayWidth
+        let targetH = targetDisplayHeight
+        let best = modes.first(where: { $0.width == targetW && $0.height == targetH && $0.maxFPS >= 30 })
+            ?? modes.first(where: { $0.width == targetW && $0.height == targetH })
+            ?? modes.first(where: { $0.maxFPS >= 30 })
             ?? modes.first(where: { $0.maxFPS >= 24 })
             ?? modes.first
         if let best {
@@ -265,6 +296,15 @@ final class CameraManager: ObservableObject {
     func applyCameraMode(_ mode: CameraMode) {
         guard let device = selectedCamera else { return }
         applyCameraMode(mode, to: device)
+    }
+
+    /// Check if a resolution has a standard video aspect ratio (16:9, 4:3, 16:10).
+    /// Square formats (1:1) like 1552x1552 are Center Stage crops — not useful for HDMI.
+    private func isStandardAspectRatio(width: Int, height: Int) -> Bool {
+        guard height > 0 else { return false }
+        let ratio = Double(width) / Double(height)
+        // 16:9 = 1.778, 4:3 = 1.333, 16:10 = 1.6, 21:9 = 2.333
+        return ratio > 1.2 && ratio < 2.5
     }
 
     private func applyCameraMode(_ mode: CameraMode, to device: AVCaptureDevice) {
@@ -400,7 +440,11 @@ struct CameraMode: Identifiable, Hashable {
     let hasPortraitEffect: Bool
     let hasCenterStage: Bool
 
-    var id: String { "\(width)x\(height)@\(Int(maxFPS))_\(codec)" }
+    /// Unique ID using the format object's identity.
+    /// Multiple formats can share the same resolution/fps/codec but differ
+    /// in color space, portrait effect support, etc. Using ObjectIdentifier
+    /// ensures SwiftUI's Picker matches the exact format that was applied.
+    var id: ObjectIdentifier { ObjectIdentifier(format) }
 
     var label: String {
         var text = "\(width)x\(height) @ \(Int(maxFPS)) fps (\(codec))"
@@ -411,7 +455,7 @@ struct CameraMode: Identifiable, Hashable {
     }
 
     static func == (lhs: CameraMode, rhs: CameraMode) -> Bool {
-        lhs.id == rhs.id
+        lhs.format === rhs.format
     }
 
     func hash(into hasher: inout Hasher) {

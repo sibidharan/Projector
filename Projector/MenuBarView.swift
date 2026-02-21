@@ -51,6 +51,11 @@ struct MenuBarView: View {
         }
         .frame(width: 340)
         .onAppear {
+            // Set target resolution from selected display so camera picks matching format
+            if let display = displayManager.selectedDisplay {
+                cameraManager.targetDisplayWidth = display.resolutionWidth
+                cameraManager.targetDisplayHeight = display.resolutionHeight
+            }
             cameraManager.startSession()
             audioManager.updateCameraAudioDevice(for: cameraManager.selectedCamera)
             // Enable level metering only while the popover is visible
@@ -63,6 +68,12 @@ struct MenuBarView: View {
         }
         .onChange(of: cameraManager.selectedCamera) { _, newCamera in
             audioManager.updateCameraAudioDevice(for: newCamera)
+        }
+        .onChange(of: displayManager.selectedDisplay) { _, newDisplay in
+            if let display = newDisplay {
+                cameraManager.targetDisplayWidth = display.resolutionWidth
+                cameraManager.targetDisplayHeight = display.resolutionHeight
+            }
         }
     }
 
